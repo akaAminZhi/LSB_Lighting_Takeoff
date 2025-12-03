@@ -1376,6 +1376,30 @@ def _sample_nodes_on_polyline(poly: List[Point], grid_px: float) -> List[Point]:
     return uniq
 
 
+def _dedup_cycle(poly: List[Point]) -> List[Point]:
+    """移除折线中的回环，避免同一段往返画两次。
+
+    遇到重复节点时，保留第一次出现的位置，剪掉中间形成的环路，
+    保证输出路径是简单路径（不自交、不回退）。
+    """
+    if len(poly) < 3:
+        return poly
+
+    idx = {}
+    out: List[Point] = []
+    for p in poly:
+        if p in idx:
+            cut = idx[p]
+            out = out[: cut + 1]
+            idx = {q: i for i, q in enumerate(out)}
+            continue
+        idx[p] = len(out)
+        out.append(p)
+    if len(out) >= 2 and out[-1] == out[-2]:
+        out.pop()
+    return out
+
+
 def mainbus_subject_for_type_count(k: int) -> str:
     k_capped = max(1, min(3, int(k)))
     wires = 2 * k_capped + 1
@@ -1474,13 +1498,16 @@ def build_steiner_trunk_paths(
 
     # 1) 先接最近的 JB（以 Panel 为起点）
     first = min(remaining, key=lambda j: manhattan(panel_coord, jb_xy[j]))
-    path0 = route_rect_with_walls(
+    path0_raw = route_rect_with_walls(
         panel_grid,
         jb_xy[first],
         walls=walls,
         grid_px=grid_px,
         clearance_px=clearance_px,
     )
+    if path0_raw is None:
+        path0_raw = [panel_grid, jb_xy[first]]
+    path0 = _dedup_cycle(path0_raw)
     S0 = set(jb_types[first])
     for p in _sample_nodes_on_polyline(path0, grid_px):
         if p not in node_types:
@@ -1499,7 +1526,7 @@ def build_steiner_trunk_paths(
 
     # 2) 依次把剩余 JB 接入已有的树
     while remaining:
-        best = None
+        best = None  # (shared_circuits, -length, path_index_increment)
         best_j = None
         best_to = None
         best_path = None
@@ -1519,7 +1546,7 @@ def build_steiner_trunk_paths(
                 if len(U) > 3:
                     # 超过 3 种，直接跳过这个接入点
                     continue
-                path = route_rect_with_walls(
+                path_raw = route_rect_with_walls(
                     jb_xy[j],
                     t,
                     walls=walls,
@@ -1528,11 +1555,16 @@ def build_steiner_trunk_paths(
                     node_limit=node_limit,
                     deadline_s=deadline_s,
                 )
-                if path is None:
+                if path_raw is None:
                     continue
+                path = _dedup_cycle(path_raw)
                 L = rect_path_length(path)
-                if (best is None) or (L < best):
-                    best = L
+
+                shared = len(set(node_types.get(t, set())) & Sj)
+                # 优先选择能共享更多回路的接入点；否则按距离最短
+                cand_key = (shared, -L, len(paths))
+                if (best is None) or (cand_key > best):
+                    best = cand_key
                     best_j = j
                     best_to = t
                     best_path = path
@@ -1542,7 +1574,7 @@ def build_steiner_trunk_paths(
         if best_path is None:
             j = remaining.pop()
             Sj = set(jb_types[j])
-            path = route_rect_with_walls(
+            path_raw = route_rect_with_walls(
                 panel_grid,
                 jb_xy[j],
                 walls=walls,
@@ -1551,6 +1583,7 @@ def build_steiner_trunk_paths(
                 node_limit=node_limit,
                 deadline_s=deadline_s,
             )
+            path = _dedup_cycle(path_raw or [panel_grid, jb_xy[j]])
             for p in _sample_nodes_on_polyline(path, grid_px):
                 if p not in node_types:
                     node_types[p] = set(Sj)
