@@ -1553,31 +1553,55 @@ def _trim_path_to_new_segments(
     poly: List[Point], trunk_segments: Set[Tuple[Point, Point]]
 ) -> Tuple[List[Point], Point]:
     """
-    给定一条折线 poly，从头开始往前走：
-      - 只要当前段不在 trunk_segments 里，就继续；
-      - 一旦遇到第一条“老主干段”，就停在该段的起点，
-        后面整段都不要。
+    给定一条折线 poly，只留下“还未占用”的新增段，任何已经存在于
+    trunk_segments 里的连续段都会被折叠成一个锚点：
+
+      - 第一次进入已存在的主干时，记录该进入点为 join_point；
+      - 在已有主干上行走的部分不会重复加入，只在离开时把出口点加回，
+        以保证后续新增段与主干衔接；
+      - 如果整条路径都落在主干上，至少保留一小段，保证拓扑连通。
 
     返回：(修剪后的路径, 连接点 join_point)
     """
-    if len(poly) < 2 or not trunk_segments:
+    if len(poly) < 2:
+        return poly[:], poly[-1]
+    if not trunk_segments:
         return poly, poly[-1]
 
     base = _poly_to_base_segs(poly)
-    cut = len(base)
-    for i, seg in enumerate(base):
-        if seg in trunk_segments:  # 注意 seg 已是 _norm_seg 过的
-            cut = i
-            break
+    out: List[Point] = [poly[0]]
+    on_trunk = False
+    last_trunk_point: Optional[Point] = None
+    first_join: Optional[Point] = None
 
-    if cut == len(base):
-        # 跟现有主干没有重合，整条都是“新路”
-        return poly, poly[-1]
+    for (a, b), p_next in zip(base, poly[1:]):
+        seg = (a, b)
+        if seg in trunk_segments:
+            if not on_trunk:
+                first_join = first_join or a
+                on_trunk = True
+            last_trunk_point = b
+            # 不把主干段再写入 out，避免重复
+            continue
 
-    # 保留到第 cut 段的起点为止
-    trimmed = poly[: cut + 1]
-    join_point = trimmed[-1]
-    return trimmed, join_point
+        # 当前段是新增段
+        if on_trunk:
+            # 从主干离开，先把出口点写回，确保几何衔接
+            if last_trunk_point is not None and out[-1] != last_trunk_point:
+                out.append(last_trunk_point)
+            on_trunk = False
+        out.append(p_next)
+
+    # 如果最终停在主干上，路径中可能没有新增段，兜底至少保留一段
+    join_point = first_join or poly[-1]
+    if len(out) < 2:
+        anchor = join_point
+        if anchor == out[0] and len(poly) > 1:
+            anchor = poly[1]
+        out = [out[0], anchor]
+
+    out = simplify_rectilinear_path(out)
+    return out, join_point
 
 
 def build_steiner_trunk_paths(
