@@ -1712,11 +1712,17 @@ def build_steiner_trunk_paths(
 
         for j in list(remaining):
             Sj = set(jb_types[j])  # 当前 JB 自己的回路集合
-            # 候选接入点：距离该 JB 最近的若干 tree_nodes
+
+            def _cand_key(p: Point):
+                # 先挑已经有同回路的节点，再按距离排序
+                shared = len(node_types.get(p, set()) & Sj)
+                return (0 if shared > 0 else 1, manhattan(jb_xy[j], p))
+
+            # 候选接入点：优先同回路节点，其次距离最近的若干 tree_nodes
             cand_nodes = (
-                sorted(tree_nodes, key=lambda p: manhattan(jb_xy[j], p))[:k_attach]
+                sorted(tree_nodes, key=_cand_key)[:k_attach]
                 if len(tree_nodes) > k_attach
-                else tree_nodes
+                else sorted(tree_nodes, key=_cand_key)
             )
             for t in cand_nodes:
                 # 预估如果接在 t 上，这里会有多少种回路
@@ -1741,7 +1747,8 @@ def build_steiner_trunk_paths(
                     continue
                 L = rect_path_length(path)
                 overlap = len(set(_poly_to_base_segs(path, grid_px)) & trunk_segments)
-                score = (-overlap, L)
+                shared = len(node_types.get(t, set()) & Sj)
+                score = (-shared, -overlap, L)
                 if (best_score is None) or (score < best_score):
                     best_score = score
                     best_j = j
