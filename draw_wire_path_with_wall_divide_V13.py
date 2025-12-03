@@ -118,7 +118,8 @@ def _point_to_segment_distance(px, py, ax, ay, bx, by) -> float:
     vx, vy = bx - ax, by - ay
     ux, uy = px - ax, py - ay
     denom = vx * vx + vy * vy
-    t = 0.0 if denom == 0 else clamp01((ux * vx + uy) / denom)
+    # 修正：投影参数 t 的分子应为 ux*vx + uy*vy
+    t = 0.0 if denom == 0 else clamp01((ux * vx + uy * vy) / denom)
     cx, cy = ax + t * vx, ay + t * vy
     dx, dy = px - cx, py - cy
     return math.hypot(dx, dy)
@@ -188,44 +189,6 @@ def simplify_orthogonal(poly: List[Point]) -> List[Point]:
     return out
 
 
-def simplify_rectilinear_path(poly: List[Point]) -> List[Point]:
-    """
-    去掉“来回折返”的冗余段：
-      - 形如 A -> B -> A 的完全折返会被直接抵消
-      - 最后再走一遍 simplify_orthogonal 去掉冗余共线点
-    约定 poly 为正交折线（水平 / 垂直）。
-    """
-    if len(poly) <= 2:
-        return poly[:]
-
-    out: List[Point] = [poly[0]]
-    seg_stack: List[Tuple[Point, Point]] = []
-
-    def _norm(a: Point, b: Point) -> Tuple[Point, Point]:
-        # 用无向 key 表示一条线段，这样 AB 和 BA 视为同一段
-        return (a, b) if a <= b else (b, a)
-
-    for p in poly[1:]:
-        prev = out[-1]
-        if p == prev:
-            # 重复点直接跳过
-            continue
-
-        seg = _norm(prev, p)
-
-        # 如果上一段和当前段是同一条线段（只是方向相反），直接抵消
-        if seg_stack and seg_stack[-1] == seg:
-            seg_stack.pop()
-            out.pop()  # 把 prev 弹掉，相当于 A->B->A 被收缩成 A
-            continue
-
-        seg_stack.append(seg)
-        out.append(p)
-
-    # 最后再做一次“共线点”简化
-    return simplify_orthogonal(out)
-
-
 def nudge_point_off_walls(
     p: Point,
     *,
@@ -275,14 +238,7 @@ def a_star_rectilinear(
     bbox_margin_cells: int = 6,
     node_limit: int = 20000,
     deadline_s: float = 0.25,
-    preferred_edges: Optional[Set[Tuple[Point, Point]]] = None,
-    corridor_discount: float = 0.5,
 ) -> Optional[List[Point]]:
-    """
-    A* 栅格寻路（正交），新增：
-      - preferred_edges: 一组“推荐使用”的线段（无向），比如已有主干里的段；
-      - corridor_discount: 在这些段上走一步的成本折扣因子（0~1），例如 0.5 表示打 5 折。
-    """
     if grid_px <= 0:
         grid_px = 50.0
 
@@ -317,11 +273,10 @@ def a_star_rectilinear(
     t0 = time.time()
     openq = []
     heappush(openq, (h(s), 0.0, s))
-    came: Dict[Point, Point] = {}
-    gscore: Dict[Point, float] = {s: 0.0}
-    visited: Set[Point] = set()
+    came = {}
+    gscore = {s: 0.0}
+    visited = set()
     expanded = 0
-
     while openq:
         if expanded > node_limit or (time.time() - t0) > deadline_s:
             return None
@@ -330,7 +285,6 @@ def a_star_rectilinear(
             continue
         visited.add(cur)
         expanded += 1
-
         if cur == g:
             path = [cur]
             while cur in came:
@@ -338,21 +292,12 @@ def a_star_rectilinear(
                 path.append(cur)
             path.reverse()
             return simplify_orthogonal(path)
-
         for nb in neighbors(cur):
-            # === 关键：在 preferred_edges 上走时打折 ===
-            step_cost = grid_px
-            if preferred_edges:
-                key = _norm_seg(cur, nb)
-                if key in preferred_edges:
-                    step_cost *= corridor_discount
-
-            tentative = gs + step_cost
+            tentative = gs + grid_px
             if tentative < gscore.get(nb, float("inf")):
                 gscore[nb] = tentative
                 came[nb] = cur
                 heappush(openq, (tentative + h(nb), tentative, nb))
-
     return None
 
 
@@ -368,62 +313,15 @@ def route_rect_with_walls(
     max_refine_rounds: int = 1,
     node_limit: int = 15000,
     deadline_s: float = 0.20,
-    preferred_edges: Optional[Set[Tuple[Point, Point]]] = None,
-    corridor_discount: float = 0.5,
 ) -> List[Point]:
-    """
-    a,b 之间的正交路径（避墙）：
-
-    - 如果没有 preferred_edges：行为跟你原来的版本一样：
-        先试简单 dogleg，通过就直接用；不行再上 A*。
-    - 如果有 preferred_edges（即在“主干阶段”）：
-        一定会先跑一遍带 corridor 折扣的 A*，
-        就算简单 dogleg 不撞墙也不会直接返回，
-        这样才会真正“贴着已存在的主干走”。
-    """
-
-    # 先预计算 dogleg 以及它是否会撞墙（作为兜底用）
     cand = orthogonal_dogleg(a, b, mode="auto")
-    dogleg_ok = True
+    ok = True
     for u, v in zip(cand, cand[1:]):
         if segment_hits_walls(u, v, walls, clearance_px=clearance_px):
-            dogleg_ok = False
+            ok = False
             break
-
-    use_corridor = bool(preferred_edges)  # 主干阶段会传进来非空集合
-
-    # ---- 分支 1：没有“高速公路”信息，保持原有行为 ----
-    if not use_corridor:
-        # dogleg 不撞墙，直接用最短路径
-        if dogleg_ok:
-            return simplify_rectilinear_path(cand)
-
-        # 否则再上 A*
-        for expand_i in range(max_expand_rounds + 1):
-            cur_margin = bbox_margin_cells * (2**expand_i)
-            cur_grid = grid_px
-            for _ in range(max_refine_rounds + 1):
-                path = a_star_rectilinear(
-                    a,
-                    b,
-                    grid_px=cur_grid,
-                    walls=walls,
-                    clearance_px=clearance_px,
-                    bbox_margin_cells=cur_margin,
-                    node_limit=node_limit,
-                    deadline_s=deadline_s,
-                    preferred_edges=None,  # 没有高速公路
-                    corridor_discount=1.0,
-                )
-                if path:
-                    return simplify_rectilinear_path(path)
-                cur_grid = max(cur_grid / 2.0, 5.0)
-
-        # 实在找不到，就用原始 dogleg（哪怕它有点贴墙）
-        return simplify_rectilinear_path(cand)
-
-    # ---- 分支 2：有 preferred_edges（主干阶段），优先贴主干 ----
-    # 不管 dogleg 撞不撞墙，都先尝试一轮“走高速”的 A*
+    if ok:
+        return cand
     for expand_i in range(max_expand_rounds + 1):
         cur_margin = bbox_margin_cells * (2**expand_i)
         cur_grid = grid_px
@@ -437,38 +335,11 @@ def route_rect_with_walls(
                 bbox_margin_cells=cur_margin,
                 node_limit=node_limit,
                 deadline_s=deadline_s,
-                preferred_edges=preferred_edges,  # ★ 真正用上高速公路
-                corridor_discount=corridor_discount,
             )
             if path:
-                return simplify_rectilinear_path(path)
+                return path
             cur_grid = max(cur_grid / 2.0, 5.0)
-
-    # 如果带高速公路的 A* 都失败了，再退回“原始逻辑”
-    if dogleg_ok:
-        return simplify_rectilinear_path(cand)
-
-    for expand_i in range(max_expand_rounds + 1):
-        cur_margin = bbox_margin_cells * (2**expand_i)
-        cur_grid = grid_px
-        for _ in range(max_refine_rounds + 1):
-            path = a_star_rectilinear(
-                a,
-                b,
-                grid_px=cur_grid,
-                walls=walls,
-                clearance_px=clearance_px,
-                bbox_margin_cells=cur_margin,
-                node_limit=node_limit,
-                deadline_s=deadline_s,
-                preferred_edges=None,
-                corridor_discount=1.0,
-            )
-            if path:
-                return simplify_rectilinear_path(path)
-            cur_grid = max(cur_grid / 2.0, 5.0)
-
-    return simplify_rectilinear_path(cand)
+    return cand
 
 
 # ==================== PDF 提取设备 ====================
@@ -1150,18 +1021,11 @@ def _norm_seg(a: Point, b: Point) -> Tuple[Point, Point]:
     return (a, b) if a <= b else (b, a)
 
 
-def _poly_to_base_segs(
-    poly: List[Point], grid_px: Optional[float] = None
-) -> List[Tuple[Point, Point]]:
+def _poly_to_base_segs(poly: List[Point]) -> List[Tuple[Point, Point]]:
     segs = []
-
-    def _snap_if_needed(p: Point) -> Point:
-        return snap(p, grid_px) if grid_px is not None else p
-
     for u, v in zip(poly, poly[1:]):
-        u_s, v_s = _snap_if_needed(u), _snap_if_needed(v)
-        if u_s != v_s:
-            segs.append(_norm_seg(u_s, v_s))
+        if u != v:
+            segs.append(_norm_seg(u, v))
     return segs
 
 
@@ -1351,6 +1215,13 @@ def build_trunk_chains_from_tree(
                     if root is not None and cur == root:
                         break
 
+                    # ★ 新增：如果当前节点是“分叉点”（度数 ≥ 3），
+                    #   就不要再穿过去了，在这里强制把链条断开。
+                    #   像你例子里的 (1800, 2450) 就是这种情况：
+                    #   它同时接 Panel 竖干、左边去 650、右边去 700。
+                    if len(tree_adj.get(cur, ())) >= 3:
+                        break
+
                     candidates = []
                     for w in tree_adj.get(cur, ()):
                         if w == prev:
@@ -1513,6 +1384,30 @@ def _sample_nodes_on_polyline(poly: List[Point], grid_px: float) -> List[Point]:
     return uniq
 
 
+def _dedup_cycle(poly: List[Point]) -> List[Point]:
+    """移除折线中的回环，避免同一段往返画两次。
+
+    遇到重复节点时，保留第一次出现的位置，剪掉中间形成的环路，
+    保证输出路径是简单路径（不自交、不回退）。
+    """
+    if len(poly) < 3:
+        return poly
+
+    idx = {}
+    out: List[Point] = []
+    for p in poly:
+        if p in idx:
+            cut = idx[p]
+            out = out[: cut + 1]
+            idx = {q: i for i, q in enumerate(out)}
+            continue
+        idx[p] = len(out)
+        out.append(p)
+    if len(out) >= 2 and out[-1] == out[-2]:
+        out.pop()
+    return out
+
+
 def mainbus_subject_for_type_count(k: int) -> str:
     k_capped = max(1, min(3, int(k)))
     wires = 2 * k_capped + 1
@@ -1556,63 +1451,6 @@ def mainbus_width_for_type_count(k: int) -> float:
     return width
 
 
-def _trim_path_to_new_segments(
-    poly: List[Point], trunk_segments: Set[Tuple[Point, Point]], grid_px: Optional[float]
-) -> Tuple[List[Point], Point]:
-    """
-    给定一条折线 poly，只留下“还未占用”的新增段，任何已经存在于
-    trunk_segments 里的连续段都会被折叠成一个锚点：
-
-      - 第一次进入已存在的主干时，记录该进入点为 join_point；
-      - 在已有主干上行走的部分不会重复加入，只在离开时把出口点加回，
-        以保证后续新增段与主干衔接；
-      - 如果整条路径都落在主干上，至少保留一小段，保证拓扑连通。
-
-    返回：(修剪后的路径, 连接点 join_point)
-    """
-    poly_snap = snap_poly_to_grid(poly, grid_px) if grid_px is not None else poly[:]
-
-    if len(poly_snap) < 2:
-        return poly_snap[:], poly_snap[-1]
-    if not trunk_segments:
-        return poly_snap, poly_snap[-1]
-
-    base = _poly_to_base_segs(poly_snap, grid_px)
-    out: List[Point] = [poly_snap[0]]
-    on_trunk = False
-    last_trunk_point: Optional[Point] = None
-    first_join: Optional[Point] = None
-
-    for (a, b), p_next in zip(base, poly_snap[1:]):
-        seg = (a, b)
-        if seg in trunk_segments:
-            if not on_trunk:
-                first_join = first_join or a
-                on_trunk = True
-            last_trunk_point = b
-            # 不把主干段再写入 out，避免重复
-            continue
-
-        # 当前段是新增段
-        if on_trunk:
-            # 从主干离开，先把出口点写回，确保几何衔接
-            if last_trunk_point is not None and out[-1] != last_trunk_point:
-                out.append(last_trunk_point)
-            on_trunk = False
-        out.append(p_next)
-
-    # 如果最终停在主干上，路径中可能没有新增段，兜底至少保留一段
-    join_point = first_join or poly_snap[-1]
-    if len(out) < 2:
-        anchor = join_point
-        if anchor == out[0] and len(poly_snap) > 1:
-            anchor = poly_snap[1]
-        out = [out[0], anchor]
-
-    out = simplify_rectilinear_path(out)
-    return out, join_point
-
-
 def build_steiner_trunk_paths(
     panel_coord: Point,
     jb_xy: List[Point],
@@ -1650,12 +1488,12 @@ def build_steiner_trunk_paths(
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     panel_grid = snap(panel_coord, grid_px)
-    # === 新增：同一个 comp 内维护一条“高速公路”边集 ===
-    corridor_discount = 0.5  # 高速公路折扣，你可以调成 0.3/0.7 之类试效果
-    preferred_edges: Set[Tuple[Point, Point]] = set()
-    trunk_segments: Set[Tuple[Point, Point]] = set()  # ★ 新增：所有已有主干段（无向）
+
     # ------- 第一步：按旧逻辑构建 Steiner 树（不在这里算 types） -------
     tree_nodes: List[Point] = [panel_grid]
+    tree_node_set: Set[Point] = {
+        panel_grid
+    }  # *** 新增：方便后面快速判断是否已在树中 ***
     # 节点上预估的回路集合（只用于控制“同一路径上最多 3 个回路”的约束）
     node_types: Dict[Point, Set[str]] = {panel_grid: set()}
 
@@ -1671,26 +1509,22 @@ def build_steiner_trunk_paths(
 
     # 1) 先接最近的 JB（以 Panel 为起点）
     first = min(remaining, key=lambda j: manhattan(panel_coord, jb_xy[j]))
-    path0 = snap_poly_to_grid(
-        simplify_rectilinear_path(
-            route_rect_with_walls(
-                panel_grid,
-                jb_xy[first],
-                walls=walls,
-                grid_px=grid_px,
-                clearance_px=clearance_px,
-            )
-        ),
-        grid_px,
+    path0_raw = route_rect_with_walls(
+        panel_grid,
+        jb_xy[first],
+        walls=walls,
+        grid_px=grid_px,
+        clearance_px=clearance_px,
     )
-    # 把第一条主干的所有段加入高速公路集合
-    preferred_edges |= set(_poly_to_base_segs(path0, grid_px))
-    trunk_segments |= set(_poly_to_base_segs(path0, grid_px))
+    if path0_raw is None:
+        path0_raw = [panel_grid, jb_xy[first]]
+    path0 = _dedup_cycle(path0_raw)
     S0 = set(jb_types[first])
     for p in _sample_nodes_on_polyline(path0, grid_px):
         if p not in node_types:
             node_types[p] = set(S0)
             tree_nodes.append(p)
+            tree_node_set.add(p)  # *** 新增 ***
         else:
             node_types[p] |= S0
             if len(node_types[p]) > 3:
@@ -1704,7 +1538,7 @@ def build_steiner_trunk_paths(
 
     # 2) 依次把剩余 JB 接入已有的树
     while remaining:
-        best_score = None
+        best = None  # (shared_circuits, -length, path_index_increment)
         best_j = None
         best_to = None
         best_path = None
@@ -1712,17 +1546,11 @@ def build_steiner_trunk_paths(
 
         for j in list(remaining):
             Sj = set(jb_types[j])  # 当前 JB 自己的回路集合
-
-            def _cand_key(p: Point):
-                # 先挑已经有同回路的节点，再按距离排序
-                shared = len(node_types.get(p, set()) & Sj)
-                return (0 if shared > 0 else 1, manhattan(jb_xy[j], p))
-
-            # 候选接入点：优先同回路节点，其次距离最近的若干 tree_nodes
+            # 候选接入点：距离该 JB 最近的若干 tree_nodes
             cand_nodes = (
-                sorted(tree_nodes, key=_cand_key)[:k_attach]
+                sorted(tree_nodes, key=lambda p: manhattan(jb_xy[j], p))[:k_attach]
                 if len(tree_nodes) > k_attach
-                else sorted(tree_nodes, key=_cand_key)
+                else tree_nodes
             )
             for t in cand_nodes:
                 # 预估如果接在 t 上，这里会有多少种回路
@@ -1730,27 +1558,25 @@ def build_steiner_trunk_paths(
                 if len(U) > 3:
                     # 超过 3 种，直接跳过这个接入点
                     continue
-                path = simplify_rectilinear_path(
-                    route_rect_with_walls(
-                        jb_xy[j],
-                        t,
-                        walls=walls,
-                        grid_px=grid_px,
-                        clearance_px=clearance_px,
-                        node_limit=node_limit,
-                        deadline_s=deadline_s,
-                        preferred_edges=preferred_edges,  # ★ 新增
-                        corridor_discount=corridor_discount,  # ★ 新增
-                    )
+                path_raw = route_rect_with_walls(
+                    jb_xy[j],
+                    t,
+                    walls=walls,
+                    grid_px=grid_px,
+                    clearance_px=clearance_px,
+                    node_limit=node_limit,
+                    deadline_s=deadline_s,
                 )
-                if path is None:
+                if path_raw is None:
                     continue
+                path = _dedup_cycle(path_raw)
                 L = rect_path_length(path)
-                overlap = len(set(_poly_to_base_segs(path, grid_px)) & trunk_segments)
-                shared = len(node_types.get(t, set()) & Sj)
-                score = (-shared, -overlap, L)
-                if (best_score is None) or (score < best_score):
-                    best_score = score
+
+                shared = len(set(node_types.get(t, set())) & Sj)
+                # 优先选择能共享更多回路的接入点；否则按距离最短
+                cand_key = (shared, -L, len(paths))
+                if (best is None) or (cand_key > best):
+                    best = cand_key
                     best_j = j
                     best_to = t
                     best_path = path
@@ -1760,27 +1586,16 @@ def build_steiner_trunk_paths(
         if best_path is None:
             j = remaining.pop()
             Sj = set(jb_types[j])
-            raw_path = simplify_rectilinear_path(
-                route_rect_with_walls(
-                    panel_grid,
-                    jb_xy[j],
-                    walls=walls,
-                    grid_px=grid_px,
-                    clearance_px=clearance_px,
-                    node_limit=node_limit,
-                    deadline_s=deadline_s,
-                    preferred_edges=preferred_edges,
-                    corridor_discount=corridor_discount,
-                )
+            path_raw = route_rect_with_walls(
+                panel_grid,
+                jb_xy[j],
+                walls=walls,
+                grid_px=grid_px,
+                clearance_px=clearance_px,
+                node_limit=node_limit,
+                deadline_s=deadline_s,
             )
-            path, join_point = _trim_path_to_new_segments(
-                raw_path, trunk_segments, grid_px
-            )
-            if len(path) < 2 and len(raw_path) >= 2:
-                path = raw_path[:2]
-                join_point = path[-1]
-
-            preferred_edges |= set(_poly_to_base_segs(path, grid_px))
+            path = _dedup_cycle(path_raw or [panel_grid, jb_xy[j]])
             for p in _sample_nodes_on_polyline(path, grid_px):
                 if p not in node_types:
                     node_types[p] = set(Sj)
@@ -1790,44 +1605,90 @@ def build_steiner_trunk_paths(
                     if len(node_types[p]) > 3:
                         node_types[p] = set(list(node_types[p])[:3])
             paths.append(path)
-            joins_basic.append((0, j + 1, join_point))
+            joins_basic.append((0, j + 1, path[-1]))
             path_jb_index.append(j)
             continue
 
-        # 如果这条接入路径已经有部分踩在现有主干上，把“老路”剔掉，只留下新增的部分。
-        trimmed_path, join_point = _trim_path_to_new_segments(
-            best_path, trunk_segments, grid_px
-        )
-        if len(trimmed_path) < 2 and len(best_path) >= 2:
-            # 完全重合的极端情况，至少保留一段最短边保证拓扑连通
-            trimmed_path = best_path[:2]
-            join_point = trimmed_path[-1]
+        # ====== 把路径截断 / 吸附到已有 trunk 上 ======
+        nodes_seq = _sample_nodes_on_polyline(best_path, grid_px)
+        join_point = nodes_seq[-1]  # 默认还是原来的终点
 
-        # 把 best_j 按 trimmed_path 接入 join_point
-        for p in _sample_nodes_on_polyline(trimmed_path, grid_px):
+        # 允许“接近已有节点”也算碰到 trunk：
+        #   snap_tol ~ 0.6 * grid，大概就是你现在看到 2450 / 2458 那种偏一格的情况。
+        snap_tol = grid_px * 0.6
+
+        def find_near_tree_node(p: Point) -> Optional[Point]:
+            best_q = None
+            best_d = None
+            for q in tree_node_set:
+                d = abs(p[0] - q[0]) + abs(p[1] - q[1])
+                if d <= snap_tol and (best_d is None or d < best_d):
+                    best_q, best_d = q, d
+            return best_q
+
+        truncate_idx = None
+        snap_target: Optional[Point] = None
+
+        # 从第二个点开始查（跳过起点）
+        for idx, p in enumerate(nodes_seq[1:], start=1):
+            if p in tree_node_set:
+                truncate_idx = idx
+                snap_target = p
+                break
+            q = find_near_tree_node(p)
+            if q is not None:
+                truncate_idx = idx
+                snap_target = q
+                break
+
+        if truncate_idx is not None and snap_target is not None:
+            # 先保留到命中的那一段
+            head = nodes_seq[: truncate_idx + 1]
+            # 把最后一个点直接替换成“吸附到 trunk 上的节点”
+            head[-1] = snap_target
+
+            # 为了安全，最后两点用 A* 再走一次，避免跨墙
+            if len(head) >= 2:
+                a = head[-2]
+                b = head[-1]
+                sub_path = route_rect_with_walls(
+                    a,
+                    b,
+                    walls=walls,
+                    grid_px=grid_px,
+                    clearance_px=clearance_px,
+                )
+                sub_nodes = _sample_nodes_on_polyline(sub_path, grid_px)
+                # 替换最后两个点
+                head = head[:-2] + sub_nodes
+
+            nodes_seq = head
+            best_path = nodes_seq[:]
+            join_point = nodes_seq[-1]
+        # 如果 truncate_idx 仍然是 None，就保持原来的 best_path 不变
+
+        # 把截断后的 best_path 写入树
+        for p in nodes_seq:
             if p not in node_types:
                 node_types[p] = set(best_types)
                 tree_nodes.append(p)
+                tree_node_set.add(p)  # *** 一定要更新 set ***
             else:
                 node_types[p] |= best_types
                 if len(node_types[p]) > 3:
                     node_types[p] = set(list(node_types[p])[:3])
 
-        # 计算 attach_idx：0=Panel，>0=JB+1，-1=接在树中间点
+        # 计算 attach_idx：0=Panel，>0=JB+1，-1=接在树中间点（注意用 join_point 而不是 best_to）
         attach_idx = -1
-        join_snap = snap(join_point, grid_px)
-        if join_snap == panel_grid:
+        if join_point == panel_grid:
             attach_idx = 0
         else:
             for j0 in comp:
-                if join_snap == jb_node(j0):
+                if join_point == jb_node(j0):
                     attach_idx = j0 + 1
                     break
 
-        preferred_edges |= set(_poly_to_base_segs(trimmed_path, grid_px))
-        trunk_segments |= set(_poly_to_base_segs(trimmed_path, grid_px))
-
-        paths.append(trimmed_path)
+        paths.append(best_path)
         joins_basic.append((attach_idx, best_j + 1, join_point))
         path_jb_index.append(best_j)
         remaining.remove(best_j)
@@ -1860,23 +1721,6 @@ def build_steiner_trunk_paths(
         adj[panel_grid].add(nearest)
         adj[nearest].add(panel_grid)
     panel_node = panel_grid
-
-    # === 新增：把离 panel_node 很近的节点（比如 JBL37 接入主干的那个点）
-    #           强制合并到 panel_node 上，让主干在拓扑上真正经过 panel_node ===
-    merge_tol = grid_px * 1.01  # 可按需要调，50px 网格的话大约 30px 内都合并
-    for q in list(adj.keys()):
-        if q == panel_node:
-            continue
-        if manhattan(q, panel_node) <= merge_tol:
-            # 把 q 的所有邻居都“接”到 panel_node 上
-            for nb in list(adj[q]):
-                if nb == panel_node:
-                    continue
-                adj[panel_node].add(nb)
-                adj[nb].add(panel_node)
-                adj[nb].discard(q)
-            # 删除旧节点 q
-            adj.pop(q, None)
 
     def bfs_path(start: Point, goal: Point) -> Optional[List[Point]]:
         """在 trunk 图上找 start -> goal 的最短路径（曼哈顿步数），用来确定 JB->Panel 的实际经过 segment。"""
@@ -2221,20 +2065,49 @@ def _draw_side(
             if p is not None:
                 children[p].append(v)
 
-        # 5. 自底向上算每个节点的“子树回路并集”，再得到每条边的回路集合
+        # 5. 自底向上算每个节点的“子树回路并集”和“子树 JB 数量”
         circuits_subtree: Dict[Point, Set[str]] = {}
+        jb_count_subtree: Dict[Point, int] = {}
+
         for v in reversed(order):
+            # 这个节点上本身挂了哪些 JB（可能多个 JB 共点）
             S = set(node_circuits.get(v, set()))
+            jb_ct = len(node_to_jb_indices.get(v, []))
+            # 把所有子节点的回路 / JB 数往上汇总
             for c in children.get(v, ()):
                 S |= circuits_subtree[c]
+                jb_ct += jb_count_subtree[c]
             circuits_subtree[v] = S
+            jb_count_subtree[v] = jb_ct
 
+        # 6. 统计“每条边被多少个 JB 的 Panel 路径经过”
+        edge_use_count: Dict[Tuple[Point, Point], int] = defaultdict(int)
+
+        for j in comp:
+            n = snap(jb_xy[j], grid_px)  # 这个 JB 对应的树节点
+            if n not in parent:
+                continue
+            cur = n
+            # 沿 parent 链一路回到 panel_node，所有路过的边 use_count +1
+            while True:
+                p = parent.get(cur)
+                if p is None:
+                    break
+                key = _norm_seg(p, cur)
+                edge_use_count[key] += 1
+                cur = p
+
+        max_use = max(edge_use_count.values()) if edge_use_count else 0
+
+        # 7. 给每条边打上 circuits（不再按 use_count 过滤）
         edge_circuits: Dict[Tuple[Point, Point], Set[str]] = {}
         for v, p in parent.items():
             if p is None:
                 continue
             key = _norm_seg(p, v)
-            edge_circuits[key] = circuits_subtree[v]
+            # 这条边承载的是“以 v 为根的子树”里的所有回路
+            S = circuits_subtree.get(v, set())
+            edge_circuits[key] = set(S)  # 确保是一个独立的 set
 
         # 6. 给节点起个名字（方便 contents 里写 “谁到谁”）
         # 6. 给节点起个名字（方便 contents 里写 “谁到谁”）
@@ -2277,16 +2150,68 @@ def _draw_side(
             root=panel_node,  # 在 Panel 节点强制断开，避免跨 Panel 合并
         )
 
+        # === 新增：对主干做“几何 + 回路集合”的去重，剔除被完全包含的短主干 ===
+        chain_infos = []
         for nodes_seq, circuits in trunk_chains:
             types = {
                 normalize_device_label(t) for t in (circuits or set()) if t is not None
             }
+            if not types:
+                continue
+
+            # 基础折线（已 snap）
+            base_poly = snap_poly_to_grid(nodes_seq, grid_px)
+            # 按网格拆成单元段，便于做集合比较
+            segs = set(_explode_to_unit_segs(base_poly, grid_px))
+            if not segs:
+                continue
+
+            chain_infos.append(
+                {
+                    "nodes": nodes_seq,
+                    "types": types,
+                    "base_poly": base_poly,
+                    "segs": segs,
+                }
+            )
+
+        # 对同一回路集合的主干做“子集去重”
+        n_ch = len(chain_infos)
+        keep_flags = [True] * n_ch
+        for i in range(n_ch):
+            if not keep_flags[i]:
+                continue
+            ti = chain_infos[i]["types"]
+            si = chain_infos[i]["segs"]
+            for j in range(n_ch):
+                if i == j or not keep_flags[j]:
+                    continue
+                tj = chain_infos[j]["types"]
+                sj = chain_infos[j]["segs"]
+                if ti != tj:
+                    continue
+
+                # si 完全被 sj 覆盖：丢掉 i
+                if si < sj:  # 真子集
+                    keep_flags[i] = False
+                    break
+                # 反过来 sj 被 si 覆盖：丢掉 j
+                if sj < si:
+                    keep_flags[j] = False
+
+        # === 只对保留的主干真正画线 ===
+        for idx, info in enumerate(chain_infos):
+            if not keep_flags[idx]:
+                continue
+
+            poly = info["base_poly"]
+            types = info["types"]
             type_count = len(types)
             if type_count <= 0:
-                continue  # 没回路就不画
+                continue
 
-            # chain 本身就是顺序的节点列表，把它 snap 成 polyline
-            poly = snap_poly_to_grid(nodes_seq, grid_px)
+            u_name = node_name(poly[0])
+            v_name = node_name(poly[-1])
 
             lane = choose_lane_for_poly(
                 poly,
@@ -2305,9 +2230,6 @@ def _draw_side(
             L_pts = rect_path_length(poly)
             L_str = format_length_ft_in(L_pts, inch_precision=0)
 
-            u_name = node_name(poly[0])
-            v_name = node_name(poly[-1])
-
             draw_polyline_annot(
                 page,
                 poly_o,
@@ -2317,7 +2239,6 @@ def _draw_side(
                 contents=f"{u_name} -> {v_name} | L={L_str}",
             )
 
-            # 这里按“包含的边数”统计一下主干段数（可选）
             trunk_edges_cnt += max(len(poly) - 1, 1)
 
         # 8. 虚拟 JB（Steiner 点）的小圈仍然用原来的 joins 逻辑，只是不要再画主干线了
