@@ -1638,12 +1638,14 @@ def build_steiner_trunk_paths(
 
     # 1) 先接最近的 JB（以 Panel 为起点）
     first = min(remaining, key=lambda j: manhattan(panel_coord, jb_xy[j]))
-    path0 = route_rect_with_walls(
+    path0 = simplify_rectilinear_path(
+        route_rect_with_walls(
         panel_grid,
         jb_xy[first],
         walls=walls,
         grid_px=grid_px,
         clearance_px=clearance_px,
+        )
     )
     # 把第一条主干的所有段加入高速公路集合
     preferred_edges |= set(_poly_to_base_segs(path0))
@@ -1666,7 +1668,7 @@ def build_steiner_trunk_paths(
 
     # 2) 依次把剩余 JB 接入已有的树
     while remaining:
-        best = None
+        best_score = None
         best_j = None
         best_to = None
         best_path = None
@@ -1686,22 +1688,26 @@ def build_steiner_trunk_paths(
                 if len(U) > 3:
                     # 超过 3 种，直接跳过这个接入点
                     continue
-                path = route_rect_with_walls(
-                    jb_xy[j],
-                    t,
-                    walls=walls,
-                    grid_px=grid_px,
-                    clearance_px=clearance_px,
-                    node_limit=node_limit,
-                    deadline_s=deadline_s,
-                    preferred_edges=preferred_edges,  # ★ 新增
-                    corridor_discount=corridor_discount,  # ★ 新增
+                path = simplify_rectilinear_path(
+                    route_rect_with_walls(
+                        jb_xy[j],
+                        t,
+                        walls=walls,
+                        grid_px=grid_px,
+                        clearance_px=clearance_px,
+                        node_limit=node_limit,
+                        deadline_s=deadline_s,
+                        preferred_edges=preferred_edges,  # ★ 新增
+                        corridor_discount=corridor_discount,  # ★ 新增
+                    )
                 )
                 if path is None:
                     continue
                 L = rect_path_length(path)
-                if (best is None) or (L < best):
-                    best = L
+                overlap = len(set(_poly_to_base_segs(path)) & trunk_segments)
+                score = (-overlap, L)
+                if (best_score is None) or (score < best_score):
+                    best_score = score
                     best_j = j
                     best_to = t
                     best_path = path
@@ -1711,16 +1717,18 @@ def build_steiner_trunk_paths(
         if best_path is None:
             j = remaining.pop()
             Sj = set(jb_types[j])
-            path = route_rect_with_walls(
-                panel_grid,
-                jb_xy[j],
-                walls=walls,
-                grid_px=grid_px,
-                clearance_px=clearance_px,
-                node_limit=node_limit,
-                deadline_s=deadline_s,
-                preferred_edges=preferred_edges,
-                corridor_discount=corridor_discount,
+            path = simplify_rectilinear_path(
+                route_rect_with_walls(
+                    panel_grid,
+                    jb_xy[j],
+                    walls=walls,
+                    grid_px=grid_px,
+                    clearance_px=clearance_px,
+                    node_limit=node_limit,
+                    deadline_s=deadline_s,
+                    preferred_edges=preferred_edges,
+                    corridor_discount=corridor_discount,
+                )
             )
             preferred_edges |= set(_poly_to_base_segs(path))
             for p in _sample_nodes_on_polyline(path, grid_px):
