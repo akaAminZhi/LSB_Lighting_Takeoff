@@ -1150,11 +1150,18 @@ def _norm_seg(a: Point, b: Point) -> Tuple[Point, Point]:
     return (a, b) if a <= b else (b, a)
 
 
-def _poly_to_base_segs(poly: List[Point]) -> List[Tuple[Point, Point]]:
+def _poly_to_base_segs(
+    poly: List[Point], grid_px: Optional[float] = None
+) -> List[Tuple[Point, Point]]:
     segs = []
+
+    def _snap_if_needed(p: Point) -> Point:
+        return snap(p, grid_px) if grid_px is not None else p
+
     for u, v in zip(poly, poly[1:]):
-        if u != v:
-            segs.append(_norm_seg(u, v))
+        u_s, v_s = _snap_if_needed(u), _snap_if_needed(v)
+        if u_s != v_s:
+            segs.append(_norm_seg(u_s, v_s))
     return segs
 
 
@@ -1550,7 +1557,7 @@ def mainbus_width_for_type_count(k: int) -> float:
 
 
 def _trim_path_to_new_segments(
-    poly: List[Point], trunk_segments: Set[Tuple[Point, Point]]
+    poly: List[Point], trunk_segments: Set[Tuple[Point, Point]], grid_px: Optional[float]
 ) -> Tuple[List[Point], Point]:
     """
     给定一条折线 poly，只留下“还未占用”的新增段，任何已经存在于
@@ -1563,18 +1570,20 @@ def _trim_path_to_new_segments(
 
     返回：(修剪后的路径, 连接点 join_point)
     """
-    if len(poly) < 2:
-        return poly[:], poly[-1]
-    if not trunk_segments:
-        return poly, poly[-1]
+    poly_snap = snap_poly_to_grid(poly, grid_px) if grid_px is not None else poly[:]
 
-    base = _poly_to_base_segs(poly)
-    out: List[Point] = [poly[0]]
+    if len(poly_snap) < 2:
+        return poly_snap[:], poly_snap[-1]
+    if not trunk_segments:
+        return poly_snap, poly_snap[-1]
+
+    base = _poly_to_base_segs(poly_snap, grid_px)
+    out: List[Point] = [poly_snap[0]]
     on_trunk = False
     last_trunk_point: Optional[Point] = None
     first_join: Optional[Point] = None
 
-    for (a, b), p_next in zip(base, poly[1:]):
+    for (a, b), p_next in zip(base, poly_snap[1:]):
         seg = (a, b)
         if seg in trunk_segments:
             if not on_trunk:
@@ -1593,11 +1602,11 @@ def _trim_path_to_new_segments(
         out.append(p_next)
 
     # 如果最终停在主干上，路径中可能没有新增段，兜底至少保留一段
-    join_point = first_join or poly[-1]
+    join_point = first_join or poly_snap[-1]
     if len(out) < 2:
         anchor = join_point
-        if anchor == out[0] and len(poly) > 1:
-            anchor = poly[1]
+        if anchor == out[0] and len(poly_snap) > 1:
+            anchor = poly_snap[1]
         out = [out[0], anchor]
 
     out = simplify_rectilinear_path(out)
@@ -1662,18 +1671,21 @@ def build_steiner_trunk_paths(
 
     # 1) 先接最近的 JB（以 Panel 为起点）
     first = min(remaining, key=lambda j: manhattan(panel_coord, jb_xy[j]))
-    path0 = simplify_rectilinear_path(
-        route_rect_with_walls(
-        panel_grid,
-        jb_xy[first],
-        walls=walls,
-        grid_px=grid_px,
-        clearance_px=clearance_px,
-        )
+    path0 = snap_poly_to_grid(
+        simplify_rectilinear_path(
+            route_rect_with_walls(
+                panel_grid,
+                jb_xy[first],
+                walls=walls,
+                grid_px=grid_px,
+                clearance_px=clearance_px,
+            )
+        ),
+        grid_px,
     )
     # 把第一条主干的所有段加入高速公路集合
-    preferred_edges |= set(_poly_to_base_segs(path0))
-    trunk_segments |= set(_poly_to_base_segs(path0))
+    preferred_edges |= set(_poly_to_base_segs(path0, grid_px))
+    trunk_segments |= set(_poly_to_base_segs(path0, grid_px))
     S0 = set(jb_types[first])
     for p in _sample_nodes_on_polyline(path0, grid_px):
         if p not in node_types:
@@ -1728,7 +1740,7 @@ def build_steiner_trunk_paths(
                 if path is None:
                     continue
                 L = rect_path_length(path)
-                overlap = len(set(_poly_to_base_segs(path)) & trunk_segments)
+                overlap = len(set(_poly_to_base_segs(path, grid_px)) & trunk_segments)
                 score = (-overlap, L)
                 if (best_score is None) or (score < best_score):
                     best_score = score
@@ -1754,12 +1766,14 @@ def build_steiner_trunk_paths(
                     corridor_discount=corridor_discount,
                 )
             )
-            path, join_point = _trim_path_to_new_segments(raw_path, trunk_segments)
+            path, join_point = _trim_path_to_new_segments(
+                raw_path, trunk_segments, grid_px
+            )
             if len(path) < 2 and len(raw_path) >= 2:
                 path = raw_path[:2]
                 join_point = path[-1]
 
-            preferred_edges |= set(_poly_to_base_segs(path))
+            preferred_edges |= set(_poly_to_base_segs(path, grid_px))
             for p in _sample_nodes_on_polyline(path, grid_px):
                 if p not in node_types:
                     node_types[p] = set(Sj)
@@ -1774,7 +1788,9 @@ def build_steiner_trunk_paths(
             continue
 
         # 如果这条接入路径已经有部分踩在现有主干上，把“老路”剔掉，只留下新增的部分。
-        trimmed_path, join_point = _trim_path_to_new_segments(best_path, trunk_segments)
+        trimmed_path, join_point = _trim_path_to_new_segments(
+            best_path, trunk_segments, grid_px
+        )
         if len(trimmed_path) < 2 and len(best_path) >= 2:
             # 完全重合的极端情况，至少保留一段最短边保证拓扑连通
             trimmed_path = best_path[:2]
@@ -1801,8 +1817,8 @@ def build_steiner_trunk_paths(
                     attach_idx = j0 + 1
                     break
 
-        preferred_edges |= set(_poly_to_base_segs(trimmed_path))
-        trunk_segments |= set(_poly_to_base_segs(trimmed_path))
+        preferred_edges |= set(_poly_to_base_segs(trimmed_path, grid_px))
+        trunk_segments |= set(_poly_to_base_segs(trimmed_path, grid_px))
 
         paths.append(trimmed_path)
         joins_basic.append((attach_idx, best_j + 1, join_point))
