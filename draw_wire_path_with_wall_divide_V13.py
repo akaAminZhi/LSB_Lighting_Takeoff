@@ -1989,10 +1989,8 @@ def _draw_side(
         lab_i = dets_side[kept_idx[local_i]]["label"]
         fam_id_dev = family_id_of_label.get(lab_i)
         fam_name_dev = family_name(fam_id_dev)
-        col_i = (
-            (color_map.get(lab_i) if color_map else None)
-            or family_colors.get(fam_id_dev)
-            or color
+        col_i = family_colors.get(fam_id_dev) or (
+            color_map.get(lab_i) if color_map else color
         )
         draw_circle_annot(
             page,
@@ -2239,7 +2237,10 @@ def _draw_side(
             poly_o = offset_poly_diag(poly, lane, lane_gap)
 
         lab_i = dets_side[kept_idx[local_i]]["label"]
-        col_i = color_map.get(lab_i) if color_map else color
+        fam_id_dev = family_id_of_label.get(lab_i)
+        col_i = family_colors.get(fam_id_dev) or (
+            color_map.get(lab_i) if color_map else color
+        )
         L_pts = rect_path_length(poly)
         L_str = format_length_ft_in(L_pts, inch_precision=0)
 
