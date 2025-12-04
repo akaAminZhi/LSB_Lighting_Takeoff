@@ -15,16 +15,15 @@ Point = Tuple[float, float]
 Edge = Tuple[int, int]
 BRANCH_SUBJECT = '(3) #10 IN 3/4" EMT'  # device→JB 固定命名
 
-# ===== 配色（Okabe–Ito，色盲友好） =====
+# ===== 配色（高亮对比，灰底可见） =====
 OKABE_ITO = [
-    (0.0, 0.447, 0.698),
-    (0.902, 0.624, 0.000),
-    (0.000, 0.619, 0.451),
-    (0.800, 0.475, 0.655),
-    (0.941, 0.894, 0.259),
-    (0.835, 0.369, 0.000),
-    (0.000, 0.000, 0.000),
-    (0.600, 0.600, 0.600),
+    (0.05, 0.55, 0.95),   # bright blue
+    (0.98, 0.55, 0.15),   # orange
+    (0.00, 0.80, 0.55),   # teal
+    (0.90, 0.25, 0.75),   # magenta
+    (0.98, 0.90, 0.25),   # yellow
+    (0.95, 0.35, 0.25),   # coral
+    (0.40, 0.75, 1.00),   # sky
 ]
 
 
@@ -907,10 +906,13 @@ def draw_polyline_annot(
     pts: List[Point],
     width: Optional[float] = 0.9,
     stroke_color: Optional[Tuple[float, float, float]] = (1, 0, 0),
-    title: str = "WIRE",
+    subject: str = "",
+    title: str = "",
     contents: str = "",
+    label: str = "",
     template_subject: str = "template",
     copy_template_appearance: bool = True,
+    info_extra: Optional[Dict[str, str]] = None,
 ) -> Optional[fitz.Annot]:
     if len(pts) < 2:
         return None
@@ -993,6 +995,7 @@ def draw_polyline_annot(
             annot.set_colors(stroke=stroke_color)
     except Exception:
         pass
+    # Do NOT set subject/author; use custom label & content instead
     try:
         if width is not None:
             annot.set_border(width=width)
@@ -1000,11 +1003,19 @@ def draw_polyline_annot(
         pass
 
     try:
-        annot.set_info(subject=title)
+        info_payload = {}
+        if subject:
+            info_payload["subject"] = subject
         if title:
-            annot.set_info(title=title)
+            info_payload["title"] = title
         if contents:
-            annot.set_info(content=contents)
+            info_payload["content"] = contents
+        if label:
+            info_payload["label"] = label
+        if info_extra:
+            info_payload.update(info_extra)
+        if info_payload:
+            annot.set_info(info_payload)
     except Exception:
         pass
     try:
@@ -1905,17 +1916,39 @@ def _draw_side(
         clearance_px=clearance_px,
     )
 
+    # 家族配色：左右面板使用不同起始偏移，避免左右颜色一致
+    palette = OKABE_ITO
+    base_offset = 0 if jb_prefix == "JBL" else 4  # shift for right side
+    family_colors = {
+        fid: palette[(fid + base_offset) % len(palette)] for fid in range(len(families))
+    }
+
+    def family_id_for_labels(labels: Set[str]) -> Optional[int]:
+        fids = {family_id_of_label.get(t) for t in labels if t in family_id_of_label}
+        fids.discard(None)
+        if len(fids) != 1:
+            return None
+        fid = next(iter(fids))
+        return fid if labels.issubset(families[fid]) else None
+
+    def family_name(fid: Optional[int]) -> str:
+        if fid is None or fid < 0 or fid >= len(families):
+            return "MIXED/UNKNOWN"
+        return ",".join(sorted(families[fid]))
+
     # ===== JB 圈 + 类型文字 =====
     for j, pt in enumerate(jb_xy):
         types_str = ",".join(sorted(list(jb_label_sets[j])))
+        fam_id_jb = family_id_for_labels(jb_label_sets[j])
+        fam_name_jb = family_name(fam_id_jb)
         draw_circle_annot(
             page,
             pt,
             r=jb_radius,
             fill_color=None,
             width=1.1,
-            title="JB",
-            contents=f"{jb_prefix}{j} | types:[{types_str}]",
+            title=f"JB {jb_prefix}{j} | fam:{fam_name_jb} | types:[{types_str}]",
+            contents="",
         )
 
     # ===== 设备圈 =====
@@ -1927,15 +1960,19 @@ def _draw_side(
     kept_centres = dev_coords  # 与 kept_idx 顺序一致
     for local_i, (x, y) in enumerate(kept_centres):
         lab_i = dets_side[kept_idx[local_i]]["label"]
-        col_i = color_map.get(lab_i) if color_map else color
+        fam_id_dev = family_id_of_label.get(lab_i)
+        fam_name_dev = family_name(fam_id_dev)
+        col_i = family_colors.get(fam_id_dev) or (
+            color_map.get(lab_i) if color_map else color
+        )
         draw_circle_annot(
             page,
             (x, y),
             r=dev_radius,
             fill_color=col_i,
             width=0.2,
-            title="DEVICE",
-            contents=f"Dev{local_i} ({lab_i})",
+            title=f"Dev{local_i} ({lab_i}) | fam:{fam_name_dev}",
+            contents="",
         )
 
     # ===== lane_map：本侧主干和支线共用，占道避免重叠 =====
@@ -1977,7 +2014,13 @@ def _draw_side(
     virtual_jb_drawn: Dict[Point, str] = {}
 
     # ===== 主干：按组件循环 =====
-    for comp in comps:
+    for comp_idx, comp in enumerate(comps):
+        comp_labels = set()
+        for j in comp:
+            comp_labels |= jb_label_sets[j]
+        comp_family_id = family_id_for_labels(comp_labels)
+        comp_family_name = family_name(comp_family_id)
+        comp_color = family_colors.get(comp_family_id, color)
         # 由 build_steiner_trunk_paths 生成主干路径 + 连接信息
         trunk_paths, joins = build_steiner_trunk_paths(
             panel_coord,
@@ -2003,6 +2046,8 @@ def _draw_side(
             }
             if not types:
                 continue
+            fam_id_here = family_id_for_labels(types) or comp_family_id
+            fam_name_here = family_name(fam_id_here)
             poly_grid = snap_poly_to_grid(poly_raw, grid_px)
             segs = set(_explode_to_unit_segs(poly_grid, grid_px))
             if not segs:
@@ -2013,6 +2058,8 @@ def _draw_side(
                     "poly_raw": poly_raw,
                     "join": jinfo,
                     "types": types,
+                    "family_id": fam_id_here,
+                    "family_name": fam_name_here,
                     "poly_grid": poly_grid,
                     "segs": segs,
                 }
@@ -2057,6 +2104,8 @@ def _draw_side(
             poly = info["poly_grid"]
 
             u_idx, v_idx, join_point, _types_on_path = jinfo
+            fam_id = info.get("family_id", comp_family_id)
+            fam_name = info.get("family_name", comp_family_name)
 
             # 分配 lane（主干是否允许重叠由 allow_trunk_overlap 控制）
             lane = choose_lane_for_poly(
@@ -2079,14 +2128,27 @@ def _draw_side(
 
             u_name = node_name_from_idx(u_idx, types)
             v_name = node_name_from_idx(v_idx, types)
+            types_str = ",".join(sorted(types))
+            label_text = f"fam:{fam_name} | types:{types_str} | " f"{u_name}->{v_name}"
+
+            bus_info = {
+                "bus_types": types_str,
+                "bus_family": fam_name,
+                "bus_component": f"{jb_prefix}-C{comp_idx}",
+                "label": label_text,
+            }
+            stroke = family_colors.get(fam_id, comp_color)
 
             draw_polyline_annot(
                 page,
                 poly_o,
                 width=trunk_width,
-                stroke_color=color,
-                title=subj,
-                contents=f"{u_name} -> {v_name} | L={L_str}",
+                stroke_color=stroke,
+                subject=subj,
+                title=label_text,
+                contents=L_str,
+                label=label_text,
+                info_extra=bus_info,
             )
             trunk_edges_cnt += max(len(poly) - 1, 1)
 
@@ -2103,8 +2165,8 @@ def _draw_side(
                         r=jb_radius * 0.6,
                         fill_color=None,
                         width=0.9,
-                        title="JB",
-                        contents=f"{jb_prefix}S | {bus_label}",
+                        title=f"JB {jb_prefix}S | {bus_label}",
+                        contents="",
                     )
                     virtual_jb_drawn[jp] = bus_label
 
@@ -2168,8 +2230,8 @@ def _draw_side(
         r=panel_radius,
         fill_color=color,
         width=0.4,
-        title="PANEL",
-        contents=f"{'LEFT' if jb_prefix=='JBL' else 'RIGHT'}",
+        title=f"PANEL | {'LEFT' if jb_prefix=='JBL' else 'RIGHT'}",
+        contents="",
     )
 
     # ===== 统计信息返回给主流程 =====
