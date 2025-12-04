@@ -2,6 +2,7 @@
 from __future__ import annotations
 import math
 import time
+import colorsys
 from collections import defaultdict, Counter
 from statistics import median
 from typing import Dict, List, Tuple, Iterable, Optional, Set, Callable
@@ -908,6 +909,7 @@ def draw_circle_annot(
     width: float = 0.8,
     title: str = "",
     contents: str = "",
+    subject: str = "",
 ):
     x, y = center
     rect = fitz.Rect(x - r, y - r, x + r, y + r)
@@ -915,7 +917,7 @@ def draw_circle_annot(
     annot.set_blendmode("Multiply")
     annot.set_colors(stroke=stroke_color, fill=fill_color)
     annot.set_border(width=width)
-    annot.set_info(subject=title)
+    annot.set_info(subject=subject)
     if title:
         annot.set_info(title=title)
     if contents:
@@ -1837,14 +1839,24 @@ def _point_side_of_line(
 
 def _split_dets_by_line(
     dets: List[Dict],
-    divider_line: Tuple[Point, Point],
+    divider_line: Optional[Tuple[Point, Point]],
     left_panel: Point,
-    right_panel: Point,
+    right_panel: Optional[Point],
     *,
     min_conf: float,
     keep_labels: Set[str],
     on_line_tol_px: float = 2.0,
 ) -> Tuple[List[Dict], List[Dict]]:
+    if divider_line is None or right_panel is None:
+        return (
+            [
+                d
+                for d in dets
+                if d.get("confidence", 1.0) >= min_conf
+                and d.get("label") in keep_labels
+            ],
+            [],
+        )
     a, b = divider_line
     left_dets = []
     right_dets = []
@@ -1899,6 +1911,8 @@ def _draw_side(
     mark_virtual_steiner: bool = True,
     max_family_types: int = 2,
     label_group_fn: Optional[Callable[[str], Optional[str]]] = None,
+    color_offset: int = 0,
+    family_color_fn: Optional[Callable[[Set[str]], Optional[Tuple[float, float, float]]]] = None,
 ):
     # 当前侧没有设备：只画 Panel 圈
     if not dets_side:
@@ -1943,12 +1957,23 @@ def _draw_side(
         label_group_fn=label_group_fn,
     )
 
-    # 家族配色：左右面板使用不同起始偏移，避免左右颜色一致
+    # 家族配色：优先使用全局分配函数，确保跨组不撞色；否则回退到左右偏移的局部方案
     palette = OKABE_ITO
-    base_offset = 0 if jb_prefix == "JBL" else 4  # shift for right side
-    family_colors = {
-        fid: palette[(fid + base_offset) % len(palette)] for fid in range(len(families))
-    }
+    base_offset = color_offset + (
+        0 if jb_prefix == "JBL" else 4
+    )  # shift by side + group
+
+    def _color_for_family(fid: int) -> Optional[Tuple[float, float, float]]:
+        if fid < 0 or fid >= len(families):
+            return None
+        fset = families[fid]
+        if family_color_fn:
+            c = family_color_fn(fset)
+            if c is not None:
+                return c
+        return palette[(fid + base_offset) % len(palette)]
+
+    family_colors = {fid: _color_for_family(fid) for fid in range(len(families))}
 
     def family_id_for_labels(labels: Set[str]) -> Optional[int]:
         fids = {family_id_of_label.get(t) for t in labels if t in family_id_of_label}
@@ -1975,6 +2000,7 @@ def _draw_side(
             fill_color=None,
             width=1.1,
             title=f"JB {jb_prefix}{j} | fam:{fam_name_jb} | types:[{types_str}]",
+            subject=f"{jb_prefix}{j}",
             contents="",
         )
 
@@ -2281,8 +2307,8 @@ def route_with_jb_strategy_dual_panels(
     dets: List[Dict],
     *,
     left_panel_coord: Point,
-    right_panel_coord: Point,
-    divider_line: Tuple[Point, Point],
+    right_panel_coord: Optional[Point],
+    divider_line: Optional[Tuple[Point, Point]],
     color=(1, 0, 0),
     capacity=8,
     eps_px=400,
@@ -2305,6 +2331,20 @@ def route_with_jb_strategy_dual_panels(
     allow_trunk_overlap: bool = False,  # 主干默认不允许重叠
     max_family_types: int = 2,
     label_group_fn: Optional[Callable[[str], Optional[str]]] = None,
+    panels_by_group: Optional[
+        Dict[
+            str,
+            Dict[
+                str,
+                Optional[
+                    Tuple[
+                        float,
+                        float,
+                    ]
+                ],
+            ],
+        ]
+    ] = None,
 ):
     doc = fitz.open(input_pdf)
     out = fitz.open()
@@ -2315,6 +2355,151 @@ def route_with_jb_strategy_dual_panels(
         all_labels = {d["label"] for d in dets if d.get("label") is not None}
         keep_labels = {l for l in all_labels if l != "PANEL"}
     keep_labels = set(keep_labels)
+    group_color_offset: Dict[str, int] = {}
+    if panels_by_group and label_group_fn:
+        group_names = list(panels_by_group.keys())
+        # 将调色盘分块，不同组（如常用/应急）起始色相错开，避免跨组撞色
+        chunk = max(1, len(OKABE_ITO) // max(1, len(group_names)))
+        group_color_offset = {
+            g: (i * chunk) % len(OKABE_ITO) for i, g in enumerate(group_names)
+        }
+
+    # 全局家族调色板：同一份 map 保证“一个家族一颜色”，不会跨组撞色
+    family_global_colors: Dict[frozenset, Tuple[float, float, float]] = {}
+
+    def _generate_color(idx: int) -> Tuple[float, float, float]:
+        if idx < len(OKABE_ITO):
+            return OKABE_ITO[idx]
+        # 超出预设时，用黄金角步进生成新色，保持区分度
+        h = (idx * 0.618033988749895) % 1.0
+        s, v = 0.65, 0.95
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        return (r, g, b)
+
+    def family_color_fn(fset: Set[str]) -> Tuple[float, float, float]:
+        key = frozenset(sorted(fset))
+        if key not in family_global_colors:
+            family_global_colors[key] = _generate_color(len(family_global_colors))
+        return family_global_colors[key]
+
+    # helper to run one group (emergency/normal)
+    def _route_group(
+        dets_group: List[Dict],
+        *,
+        left_panel: Point,
+        right_panel: Optional[Point],
+        divider: Optional[Tuple[Point, Point]],
+        prefix_left: str,
+        prefix_right: str,
+        color_offset: int = 0,
+        family_color_fn=family_color_fn,
+    ):
+        l_dets, r_dets = _split_dets_by_line(
+            dets_group,
+            divider,
+            left_panel,
+            right_panel,
+            min_conf=min_conf,
+            keep_labels=keep_labels,
+            on_line_tol_px=on_line_tol_px,
+        )
+        left_info_g = _draw_side(
+            page,
+            l_dets,
+            panel_coord=left_panel,
+            color=color,
+            capacity=capacity,
+            eps_px=eps_px,
+            grid_px=grid_px,
+            merge_eps=merge_eps,
+            min_conf=min_conf,
+            keep_labels=keep_labels,
+            jb_radius=jb_radius,
+            dev_radius=dev_radius,
+            panel_radius=panel_radius,
+            wire_width=wire_width,
+            walls=walls,
+            clearance_px=clearance_px,
+            color_map=color_map,
+            priority_families=priority_families,
+            jb_prefix=prefix_left,
+            lane_gap=lane_gap,
+            lane_mode=lane_mode,
+            allow_branch_overlap=allow_branch_overlap,
+            allow_trunk_overlap=allow_trunk_overlap,
+            mark_virtual_steiner=True,
+            max_family_types=max_family_types,
+            label_group_fn=label_group_fn,
+            color_offset=color_offset,
+            family_color_fn=family_color_fn,
+        )
+        right_info_g = (
+            _draw_side(
+                page,
+                r_dets,
+                panel_coord=right_panel,
+                color=color,
+                capacity=capacity,
+                eps_px=eps_px,
+                grid_px=grid_px,
+                merge_eps=merge_eps,
+                min_conf=min_conf,
+                keep_labels=keep_labels,
+                jb_radius=jb_radius,
+                dev_radius=dev_radius,
+                panel_radius=panel_radius,
+                wire_width=wire_width,
+                walls=walls,
+                clearance_px=clearance_px,
+                color_map=color_map,
+                priority_families=priority_families,
+                jb_prefix=prefix_right,
+                lane_gap=lane_gap,
+                lane_mode=lane_mode,
+                allow_branch_overlap=allow_branch_overlap,
+                allow_trunk_overlap=allow_trunk_overlap,
+                mark_virtual_steiner=True,
+                max_family_types=max_family_types,
+                label_group_fn=label_group_fn,
+                color_offset=color_offset,
+                family_color_fn=family_color_fn,
+            )
+            if right_panel
+            else None
+        )
+        return {
+            "left": left_info_g,
+            "right": right_info_g,
+            "left_count_dets": len(l_dets),
+            "right_count_dets": len(r_dets),
+        }
+
+    if panels_by_group and label_group_fn:
+        results = {}
+        for gname, cfg in panels_by_group.items():
+            dets_g = [d for d in dets if label_group_fn(d.get("label")) == gname]
+            if not dets_g:
+                continue
+            lp = cfg.get("left_panel") or cfg.get("panel")
+            if not lp:
+                continue
+            rp = cfg.get("right_panel")
+            div = cfg.get("divider_line")
+            results[gname] = _route_group(
+                dets_g,
+                left_panel=lp,
+                right_panel=rp,
+                divider=div,
+                prefix_left=f"{gname[:2].upper()}L",
+                prefix_right=f"{gname[:2].upper()}R",
+                color_offset=group_color_offset.get(gname, 0),
+                family_color_fn=family_color_fn,
+            )
+        out.save(output_pdf)
+        out.close()
+        return results
+
+    # legacy dual-panel path (single group)
     left_dets, right_dets = _split_dets_by_line(
         dets,
         divider_line,
@@ -2324,62 +2509,17 @@ def route_with_jb_strategy_dual_panels(
         keep_labels=keep_labels,
         on_line_tol_px=on_line_tol_px,
     )
-    left_info = _draw_side(
-        page,
-        left_dets,
-        panel_coord=left_panel_coord,
-        color=color,
-        capacity=capacity,
-        eps_px=eps_px,
-        grid_px=grid_px,
-        merge_eps=merge_eps,
-        min_conf=min_conf,
-        keep_labels=keep_labels,
-        jb_radius=jb_radius,
-        dev_radius=dev_radius,
-        panel_radius=panel_radius,
-        wire_width=wire_width,
-        walls=walls,
-        clearance_px=clearance_px,
-        color_map=color_map,
-        priority_families=priority_families,
-        jb_prefix="JBL",
-        lane_gap=lane_gap,
-        lane_mode=lane_mode,
-        allow_branch_overlap=allow_branch_overlap,
-        allow_trunk_overlap=allow_trunk_overlap,
-        mark_virtual_steiner=True,
-        max_family_types=max_family_types,
-        label_group_fn=label_group_fn,
+    res_legacy = _route_group(
+        dets,
+        left_panel=left_panel_coord,
+        right_panel=right_panel_coord,
+        divider=divider_line,
+        prefix_left="JBL",
+        prefix_right="JBR",
+        family_color_fn=family_color_fn,
     )
-    right_info = _draw_side(
-        page,
-        right_dets,
-        panel_coord=right_panel_coord,
-        color=color,
-        capacity=capacity,
-        eps_px=eps_px,
-        grid_px=grid_px,
-        merge_eps=merge_eps,
-        min_conf=min_conf,
-        keep_labels=keep_labels,
-        jb_radius=jb_radius,
-        dev_radius=dev_radius,
-        panel_radius=panel_radius,
-        wire_width=wire_width,
-        walls=walls,
-        clearance_px=clearance_px,
-        color_map=color_map,
-        priority_families=priority_families,
-        jb_prefix="JBR",
-        lane_gap=lane_gap,
-        lane_mode=lane_mode,
-        allow_branch_overlap=allow_branch_overlap,
-        allow_trunk_overlap=allow_trunk_overlap,
-        mark_virtual_steiner=True,
-        max_family_types=max_family_types,
-        label_group_fn=label_group_fn,
-    )
+    left_info = res_legacy["left"]
+    right_info = res_legacy["right"]
     out.save(output_pdf)
     out.close()
     return {
@@ -2409,9 +2549,26 @@ if __name__ == "__main__":
     def label_group_fn(lab: str) -> Optional[str]:
         return group_lookup.get(lab)
 
-    LEFT_PANEL: Point = (1941.0, 2416.0)
-    RIGHT_PANEL: Point = (1913.0, 919.0)
-    DIVIDER_LINE = ((964.16, 1648.57), (2098.93, 1948.57))
+    EMERGENCY_LEFT_PANEL: Point = (1941.0, 2416.0)
+    EMERGENCY_RIGHT_PANEL: Point = (1913.0, 919.0)
+    EMERGENCY_DIVIDER_LINE = ((964.16, 1648.57), (2098.93, 1948.57))
+
+    NORMAL_LEFT_PANEL: Point = (1941.0, 2416.0)
+    NORMAL_RIGHT_PANEL: Point = (1913.0, 919.0)
+    NORMAL_DIVIDER_LINE = ((964.16, 1648.57), (2098.93, 1948.57))
+
+    PANELS_BY_GROUP = {
+        "EMERGENCY": {
+            "left_panel": EMERGENCY_LEFT_PANEL,
+            "right_panel": EMERGENCY_RIGHT_PANEL,
+            "divider_line": EMERGENCY_DIVIDER_LINE,
+        },
+        "NORMAL": {
+            "left_panel": NORMAL_LEFT_PANEL,
+            "right_panel": NORMAL_RIGHT_PANEL,
+            "divider_line": NORMAL_DIVIDER_LINE,
+        },
+    }
     WALLS = [
         [
             [1886.137939453125, 2098.58447265625],
@@ -2531,9 +2688,9 @@ if __name__ == "__main__":
         output_pdf=output_pdf_route,
         page_index=PAGE_INDEX,
         dets=dets_all,
-        left_panel_coord=LEFT_PANEL,
-        right_panel_coord=RIGHT_PANEL,
-        divider_line=DIVIDER_LINE,
+        left_panel_coord=EMERGENCY_LEFT_PANEL,
+        right_panel_coord=EMERGENCY_RIGHT_PANEL,
+        divider_line=EMERGENCY_DIVIDER_LINE,
         color=(1, 0, 0),
         capacity=8,
         eps_px=400,
@@ -2555,5 +2712,6 @@ if __name__ == "__main__":
         allow_branch_overlap=True,  # 支线允许重叠（默认）
         allow_trunk_overlap=False,  # 主干不允许重叠（默认）
         label_group_fn=label_group_fn,
+        panels_by_group=PANELS_BY_GROUP,
     )
     print("Dual-panels routing summary:", info)
