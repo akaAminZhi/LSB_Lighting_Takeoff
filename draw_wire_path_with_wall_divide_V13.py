@@ -4,7 +4,7 @@ import math
 import time
 from collections import defaultdict, Counter
 from statistics import median
-from typing import Dict, List, Tuple, Iterable, Optional, Set
+from typing import Dict, List, Tuple, Iterable, Optional, Set, Callable
 
 import numpy as np
 from sklearn.cluster import DBSCAN
@@ -15,15 +15,24 @@ Point = Tuple[float, float]
 Edge = Tuple[int, int]
 BRANCH_SUBJECT = '(3) #10 IN 3/4" EMT'  # device→JB 固定命名
 
-# ===== 配色（高亮对比，灰底可见） =====
+# ===== 配色（高亮对比，灰底可见，16 色循环） =====
 OKABE_ITO = [
-    (0.05, 0.55, 0.95),   # bright blue
-    (0.98, 0.55, 0.15),   # orange
-    (0.00, 0.80, 0.55),   # teal
-    (0.90, 0.25, 0.75),   # magenta
-    (0.98, 0.90, 0.25),   # yellow
-    (0.95, 0.35, 0.25),   # coral
-    (0.40, 0.75, 1.00),   # sky
+    (0.05, 0.55, 0.95),  # bright blue
+    (0.98, 0.55, 0.15),  # orange
+    (0.00, 0.80, 0.55),  # teal
+    (0.90, 0.25, 0.75),  # magenta
+    (0.98, 0.90, 0.25),  # yellow
+    (0.95, 0.35, 0.25),  # coral
+    (0.40, 0.75, 1.00),  # sky
+    (0.35, 0.90, 0.35),  # lime
+    (1.00, 0.45, 0.65),  # pink
+    (0.20, 0.55, 1.00),  # cobalt
+    (1.00, 0.75, 0.30),  # amber
+    (0.60, 0.35, 0.90),  # violet
+    (0.15, 0.80, 0.90),  # aqua
+    (0.90, 0.50, 0.40),  # salmon
+    (0.80, 0.80, 0.10),  # chartreuse
+    (0.55, 0.60, 0.95),  # periwinkle
 ]
 
 
@@ -388,6 +397,7 @@ def build_disjoint_families(
     min_conf: float = 0.30,
     priority_families: Optional[List[Iterable[str]]] = None,
     max_family_size: int = 3,
+    label_group_fn: Optional[Callable[[str], Optional[str]]] = None,
 ) -> Tuple[Dict[str, int], List[Set[str]]]:
     """
     priority_families 作为“锁定家族”（allowed set）。跨允许集或 >max_family_size 的合并将被拒绝。
@@ -417,6 +427,8 @@ def build_disjoint_families(
                 lj = labs[j]
                 if li == lj:
                     continue
+                if label_group_fn and label_group_fn(li) != label_group_fn(lj):
+                    continue
                 a, b = sorted((li, lj))
                 co[(a, b)] += 1
 
@@ -425,6 +437,9 @@ def build_disjoint_families(
         return {}, []
 
     idx_of_label = {lab: i for i, lab in enumerate(labels)}
+    group_of_label = {
+        lab: (label_group_fn(lab) if label_group_fn else None) for lab in labels
+    }
 
     parent = list(range(len(labels)))
     rank = [0] * len(labels)
@@ -441,6 +456,11 @@ def build_disjoint_families(
         U = comp_labels[rx] | comp_labels[ry]
         if len(U) > max_family_size:
             return False
+        if label_group_fn:
+            gids = {group_of_label.get(t) for t in U}
+            gids.discard(None)
+            if len(gids) > 1:
+                return False
         A = comp_allowed[rx]
         B = comp_allowed[ry]
         if A is not None and not U.issubset(A):
@@ -526,6 +546,8 @@ def auto_place_junction_boxes(
     walls: Optional[List[List[Point]]] = None,
     clearance_px: float = 0.0,
     max_dev_jb_ft: Optional[float] = 6.0,  # 新增：设备→JB 最大允许长度（单位：ft）
+    max_family_types: int = 3,
+    label_group_fn: Optional[Callable[[str], Optional[str]]] = None,
 ):
     """
     自动放置 JB，增加约束：
@@ -548,7 +570,8 @@ def auto_place_junction_boxes(
         neighbor_eps_px=eps_px,
         min_conf=min_conf,
         priority_families=priority_families,
-        max_family_size=3,
+        max_family_size=max_family_types,
+        label_group_fn=label_group_fn,
     )
 
     # ===== 设备点抽取 =====
@@ -1874,6 +1897,8 @@ def _draw_side(
     allow_branch_overlap: bool,  # True=支线可重叠（但不会和主干重叠）
     allow_trunk_overlap: bool,  # True=主干可重叠
     mark_virtual_steiner: bool = True,
+    max_family_types: int = 2,
+    label_group_fn: Optional[Callable[[str], Optional[str]]] = None,
 ):
     # 当前侧没有设备：只画 Panel 圈
     if not dets_side:
@@ -1914,6 +1939,8 @@ def _draw_side(
         priority_families=priority_families,
         walls=walls,
         clearance_px=clearance_px,
+        max_family_types=max_family_types,
+        label_group_fn=label_group_fn,
     )
 
     # 家族配色：左右面板使用不同起始偏移，避免左右颜色一致
@@ -1962,8 +1989,10 @@ def _draw_side(
         lab_i = dets_side[kept_idx[local_i]]["label"]
         fam_id_dev = family_id_of_label.get(lab_i)
         fam_name_dev = family_name(fam_id_dev)
-        col_i = family_colors.get(fam_id_dev) or (
-            color_map.get(lab_i) if color_map else color
+        col_i = (
+            (color_map.get(lab_i) if color_map else None)
+            or family_colors.get(fam_id_dev)
+            or color
         )
         draw_circle_annot(
             page,
@@ -1982,7 +2011,7 @@ def _draw_side(
     comps = components_by_family(
         jb_xy,
         jb_label_sets,
-        max_types=3,
+        max_types=max_family_types,
         family_id_of_label=family_id_of_label,
         families=families,
     )
@@ -2273,6 +2302,8 @@ def route_with_jb_strategy_dual_panels(
     lane_mode: str = "axis",  # "axis"（正交友好）或 "diag"
     allow_branch_overlap: bool = True,  # 支线默认允许重叠
     allow_trunk_overlap: bool = False,  # 主干默认不允许重叠
+    max_family_types: int = 2,
+    label_group_fn: Optional[Callable[[str], Optional[str]]] = None,
 ):
     doc = fitz.open(input_pdf)
     out = fitz.open()
@@ -2317,6 +2348,8 @@ def route_with_jb_strategy_dual_panels(
         allow_branch_overlap=allow_branch_overlap,
         allow_trunk_overlap=allow_trunk_overlap,
         mark_virtual_steiner=True,
+        max_family_types=max_family_types,
+        label_group_fn=label_group_fn,
     )
     right_info = _draw_side(
         page,
@@ -2343,6 +2376,8 @@ def route_with_jb_strategy_dual_panels(
         allow_branch_overlap=allow_branch_overlap,
         allow_trunk_overlap=allow_trunk_overlap,
         mark_virtual_steiner=True,
+        max_family_types=max_family_types,
+        label_group_fn=label_group_fn,
     )
     out.save(output_pdf)
     out.close()
@@ -2358,56 +2393,129 @@ def route_with_jb_strategy_dual_panels(
 
 if __name__ == "__main__":
     # 这里用你上一条消息中的 L2_A 示例；按需替换
-    file_name = "pdf_files/L2_B"
+    file_name = "pdf_files/L2_A"
     input_pdf = f"{file_name}.pdf"
     output_pdf_route = f"{file_name}_route_dual_panels.pdf"
     PAGE_INDEX = 0
-    DEVICE_LABEL = ["16", "14", "12", "26", "8", "22", "29", "20"]
-    color_map = pick_device_colors(DEVICE_LABEL)
+    EMERGENCY_DEVICE_LABEL = ["14", "18", "10", "27", "12", "20", "24"]
+    NORMAL_DEVICE_LABEL = ["3", "5", "17", "19", "1"]
 
-    LEFT_PANEL: Point = (1745.0, 2526.0)
-    RIGHT_PANEL: Point = (1186.0, 1030.0)
-    DIVIDER_LINE = ((504.26, 1624.05), (2069.37, 1624.05))
+    DEVICE_LABEL = EMERGENCY_DEVICE_LABEL + NORMAL_DEVICE_LABEL
+    color_map = pick_device_colors(DEVICE_LABEL)
+    group_lookup = {l: "EMERGENCY" for l in EMERGENCY_DEVICE_LABEL}
+    group_lookup.update({l: "NORMAL" for l in NORMAL_DEVICE_LABEL})
+
+    def label_group_fn(lab: str) -> Optional[str]:
+        return group_lookup.get(lab)
+
+    LEFT_PANEL: Point = (1941.0, 2416.0)
+    RIGHT_PANEL: Point = (1913.0, 919.0)
+    DIVIDER_LINE = ((964.16, 1648.57), (2098.93, 1948.57))
     WALLS = [
         [
-            (1798.677978515625, 2501.622314453125),
-            (1798.677978515625, 2606.0419921875),
-            (1705.4019775390625, 2606.0419921875),
-            (1705.4019775390625, 2464.47705078125),
-            (1799.0909423828125, 2464.47705078125),
+            [1886.137939453125, 2098.58447265625],
+            [1673.4949951171875, 2098.58447265625],
+            [1673.4949951171875, 2002.552001953125],
+            [1569.6240234375, 2002.552001953125],
         ],
         [
-            (1797.791015625, 2302.97412109375),
-            (1797.791015625, 2070.4638671875),
-            (1705.0760498046875, 2070.4638671875),
-            (1705.0760498046875, 2357.8798828125),
-            (1798.5040283203125, 2357.8798828125),
-        ],
-        [(1705.7919921875, 2070.9521484375), (1392.4639892578125, 2070.9521484375)],
-        [
-            (1182.625, 962.952880859375),
-            (1231.1610107421875, 962.952880859375),
-            (1231.1610107421875, 1253.1820068359375),
-            (1145.9749755859375, 1253.1820068359375),
-            (1145.9749755859375, 961.9619140625),
+            [1673.886962890625, 2097.800537109375],
+            [1673.886962890625, 2342.78076171875],
+            [1551.9849853515625, 2342.78076171875],
+            [1551.9849853515625, 2397.2646484375],
+            [1580.20703125, 2397.2646484375],
         ],
         [
-            (1146.489990234375, 1248.9630126953125),
-            (921.7600708007812, 1248.9630126953125),
+            [1490.60205078125, 2776.81689453125],
+            [1490.60205078125, 2488.328125],
+            [1481.97900390625, 2488.328125],
+            [1481.97900390625, 2475.001220703125],
+        ],
+        [[1490.2099609375, 2384.848388671875], [1490.2099609375, 2000.718994140625]],
+        [
+            [1673.6199951171875, 2343.513427734375],
+            [1673.6199951171875, 2373.455322265625],
+            [1617.5469970703125, 2373.455322265625],
+            [1617.5469970703125, 2399.586669921875],
         ],
         [
-            (1348.33203125, 606.00390625),
-            (1348.33203125, 682.701904296875),
-            (1231.3929443359375, 682.701904296875),
-            (1231.3929443359375, 852.60791015625),
-            (1198.375, 852.60791015625),
-            (1198.375, 903.510986328125),
+            [1617.8189697265625, 2372.638916015625],
+            [1617.8189697265625, 2342.424560546875],
         ],
         [
-            (1229.6729736328125, 718.1279296875),
-            (1137.842041015625, 718.1279296875),
-            (1137.842041015625, 853.639892578125),
-            (1150.5670166015625, 853.639892578125),
+            [924.5374145507812, 1121.6910400390625],
+            [1020.7169799804688, 1121.6910400390625],
+            [1020.7169799804688, 1276.1199951171875],
+            [1327.81201171875, 1276.1199951171875],
+        ],
+        [
+            [1119.427001953125, 1274.77099609375],
+            [1119.427001953125, 1116.72900390625],
+            [1017.8280029296875, 1116.72900390625],
+        ],
+        [
+            [1105.6300048828125, 1116.802001953125],
+            [1105.6300048828125, 991.68603515625],
+            [927.598388671875, 991.68603515625],
+            [927.598388671875, 1121.0360107421875],
+        ],
+        [
+            [916.7935180664062, 904.0048828125],
+            [916.7935180664062, 694.60009765625],
+            [893.0872192382812, 694.60009765625],
+            [893.0872192382812, 594.695068359375],
+        ],
+        [
+            [916.2128295898438, 741.239990234375],
+            [1018.7780151367188, 741.239990234375],
+            [1018.7780151367188, 692.243896484375],
+            [1108.2769775390625, 692.243896484375],
+            [1108.2769775390625, 586.0859375],
+        ],
+        [
+            [1108.60400390625, 691.263916015625],
+            [1108.60400390625, 883.656005859375],
+            [1019.4310302734375, 883.656005859375],
+        ],
+        [[1019.7579956054688, 883.98193359375], [1019.7579956054688, 740.9140625]],
+        [
+            [1018.4509887695312, 819.634033203125],
+            [967.4951782226562, 819.634033203125],
+            [967.4951782226562, 879.408935546875],
+        ],
+        [
+            [1888.239013671875, 1370.2239990234375],
+            [1962.7969970703125, 1370.2239990234375],
+            [1962.7969970703125, 1272.2919921875],
+            [1768.4129638671875, 1272.2919921875],
+            [1768.4129638671875, 1371.112060546875],
+            [1810.7220458984375, 1371.112060546875],
+        ],
+        [
+            [1850.6639404296875, 1371.112060546875],
+            [1850.6639404296875, 1271.7010498046875],
+        ],
+        [
+            [1121.9100341796875, 2777.0693359375],
+            [1121.9100341796875, 2662.966796875],
+            [1112.35400390625, 2662.966796875],
+            [1112.35400390625, 2460.826171875],
+        ],
+        [
+            [1112.35400390625, 2402.61669921875],
+            [1112.35400390625, 2097.667724609375],
+            [1141.8929443359375, 2097.667724609375],
+        ],
+        [
+            [1769.2640380859375, 2793.044189453125],
+            [1769.2640380859375, 2681.948974609375],
+            [1777.6710205078125, 2681.948974609375],
+            [1777.6710205078125, 2585.86669921875],
+            [1675.5830078125, 2585.86669921875],
+            [1675.5830078125, 2490.384765625],
+            [1563.887939453125, 2490.384765625],
+            [1563.887939453125, 2680.747802734375],
+            [1568.6920166015625, 2680.747802734375],
         ],
     ]
     CLEARANCE = 3.0
@@ -2439,11 +2547,12 @@ if __name__ == "__main__":
         walls=WALLS,
         clearance_px=CLEARANCE,
         color_map=color_map,
-        priority_families=[{"14"}],
+        priority_families=[],
         on_line_tol_px=2.0,
         lane_gap=8.0,  # 并排间距
         lane_mode="diag",  # "axis"（正交友好）或 "diag"
         allow_branch_overlap=True,  # 支线允许重叠（默认）
         allow_trunk_overlap=False,  # 主干不允许重叠（默认）
+        label_group_fn=label_group_fn,
     )
     print("Dual-panels routing summary:", info)
