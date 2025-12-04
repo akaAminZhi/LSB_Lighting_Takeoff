@@ -1512,7 +1512,6 @@ def build_steiner_trunk_paths(
         walls=walls,
         grid_px=grid_px,
         clearance_px=clearance_px,
-        )
     )
     if path0_raw is None:
         path0_raw = [panel_grid, jb_xy[first]]
@@ -1535,7 +1534,7 @@ def build_steiner_trunk_paths(
 
     # 2) 依次把剩余 JB 接入已有的树
     while remaining:
-        best_score = None
+        best = None
         best_j = None
         best_to = None
         best_path = None
@@ -1573,6 +1572,12 @@ def build_steiner_trunk_paths(
                     best_j = j
                     best_to = t
                     best_path = path
+                    best_types = U
+
+        if best_path is None:
+            # 极端兜底：直接从 panel 接
+            j = remaining.pop()
+            Sj = set(jb_types[j])
             path_raw = route_rect_with_walls(
                 panel_grid,
                 jb_xy[j],
@@ -1987,16 +1992,71 @@ def _draw_side(
             deadline_s=0.30,
         )
 
-        for poly_raw, jinfo in zip(trunk_paths, joins):
-            u_idx, v_idx, join_point, types_on_path = jinfo
-
-            # 回路类型集合（已在 build_steiner_trunk_paths 里处理去重和归一化）
-            types = {normalize_device_label(t) for t in (types_on_path or set()) if t}
+        # ---------- 新增：主干“子集去重”，去掉贴在大主干上的短巴士 ----------
+        chain_infos = []  # 每一条主干的几何 + 回路集合 + 原始索引
+        for idx, (poly_raw, jinfo) in enumerate(zip(trunk_paths, joins)):
+            _u_idx, _v_idx, _join_point, types_on_path = jinfo
+            types = {
+                normalize_device_label(t)
+                for t in (types_on_path or set())
+                if t is not None and str(t).strip() != ""
+            }
             if not types:
                 continue
+            poly_grid = snap_poly_to_grid(poly_raw, grid_px)
+            segs = set(_explode_to_unit_segs(poly_grid, grid_px))
+            if not segs:
+                continue
+            chain_infos.append(
+                {
+                    "idx": idx,
+                    "poly_raw": poly_raw,
+                    "join": jinfo,
+                    "types": types,
+                    "poly_grid": poly_grid,
+                    "segs": segs,
+                }
+            )
 
-            # 基础折线 snap 到网格
-            poly = snap_poly_to_grid(poly_raw, grid_px)
+        n_ch = len(chain_infos)
+        keep_flags = [True] * n_ch
+
+        for i in range(n_ch):
+            if not keep_flags[i]:
+                continue
+            ti = chain_infos[i]["types"]
+            si = chain_infos[i]["segs"]
+            if not si:
+                keep_flags[i] = False
+                continue
+            for j in range(n_ch):
+                if i == j or not keep_flags[j]:
+                    continue
+                tj = chain_infos[j]["types"]
+                sj = chain_infos[j]["segs"]
+                if not sj:
+                    continue
+
+                # i 完全被 j 覆盖，且回路集合是子集 => i 是冗余短主干，删掉 i
+                if si <= sj and ti <= tj:
+                    keep_flags[i] = False
+                    break
+
+                # 反过来：j 完全被 i 覆盖，且回路集合是子集 => j 冗余，删掉 j
+                if sj <= si and tj <= ti:
+                    keep_flags[j] = False
+
+        # ---------- 画主干（仅保留 keep_flags=True 的那些） ----------
+        for k, info in enumerate(chain_infos):
+            if not keep_flags[k]:
+                continue
+
+            poly_raw = info["poly_raw"]
+            jinfo = info["join"]
+            types = info["types"]
+            poly = info["poly_grid"]
+
+            u_idx, v_idx, join_point, _types_on_path = jinfo
 
             # 分配 lane（主干是否允许重叠由 allow_trunk_overlap 控制）
             lane = choose_lane_for_poly(
@@ -2092,14 +2152,14 @@ def _draw_side(
         L_pts = rect_path_length(poly)
         L_str = format_length_ft_in(L_pts, inch_precision=0)
 
-        draw_polyline_annot(
-            page,
-            poly_o,
-            width=wire_width,
-            stroke_color=col_i,
-            title=BRANCH_SUBJECT,
-            contents=f"Dev{local_i}({lab_i})->{jb_prefix}{jb_idx} | L={L_str}",
-        )
+        # draw_polyline_annot(
+        #     page,
+        #     poly_o,
+        #     width=wire_width,
+        #     stroke_color=col_i,
+        #     title=BRANCH_SUBJECT,
+        #     contents=f"Dev{local_i}({lab_i})->{jb_prefix}{jb_idx} | L={L_str}",
+        # )
 
     # ===== Panel 圈 =====
     draw_circle_annot(
