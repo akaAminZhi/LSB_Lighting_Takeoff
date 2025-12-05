@@ -1831,15 +1831,46 @@ def _point_side_of_line(
     wx, wy = (px - ax), (py - ay)
     cross = vx * wy - vy * wx
     seg_len = math.hypot(vx, vy) or 1.0
-    dist = abs(cross) / seg_len
-    if dist <= on_line_tol_px:
+    dist_line = abs(cross) / seg_len
+    if dist_line <= on_line_tol_px:
         return "ON"
     return "L" if cross > 0 else "R"
 
 
+def _point_side_of_polyline(
+    p: Point,
+    poly: List[Point],
+    *,
+    on_line_tol_px: float = 2.0,
+) -> str:
+    """
+    用“点到 polyline 上最近的那一段”的左右侧作为整体的侧别。
+    距离 <= on_line_tol_px 视为在分界线上（"ON"）。
+    """
+    if not poly or len(poly) < 2:
+        return "ON"
+
+    px, py = p
+    best_dist = None
+    best_side = "ON"
+
+    for a, b in zip(poly, poly[1:]):
+        # 真正到“线段”的距离（不是无限直线）
+        dist = _point_to_segment_distance(px, py, a[0], a[1], b[0], b[1])
+
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            if dist <= on_line_tol_px:
+                best_side = "ON"
+            else:
+                best_side = _point_side_of_line(p, a, b, on_line_tol_px=on_line_tol_px)
+
+    return best_side
+
+
 def _split_dets_by_line(
     dets: List[Dict],
-    divider_line: Optional[Tuple[Point, Point]],
+    divider_line: Optional[Iterable[Point]],
     left_panel: Point,
     right_panel: Optional[Point],
     *,
@@ -1847,6 +1878,7 @@ def _split_dets_by_line(
     keep_labels: Set[str],
     on_line_tol_px: float = 2.0,
 ) -> Tuple[List[Dict], List[Dict]]:
+    # 没有 divider 或没有右侧 panel：全部归左侧
     if divider_line is None or right_panel is None:
         return (
             [
@@ -1857,7 +1889,19 @@ def _split_dets_by_line(
             ],
             [],
         )
-    a, b = divider_line
+
+    poly = list(divider_line)
+    if len(poly) < 2:
+        return (
+            [
+                d
+                for d in dets
+                if d.get("confidence", 1.0) >= min_conf
+                and d.get("label") in keep_labels
+            ],
+            [],
+        )
+
     left_dets = []
     right_dets = []
     for d in dets:
@@ -1868,15 +1912,19 @@ def _split_dets_by_line(
             continue
         cx = 0.5 * (d["x1"] + d["x2"])
         cy = 0.5 * (d["y1"] + d["y2"])
-        side = _point_side_of_line((cx, cy), a, b, on_line_tol_px=on_line_tol_px)
+
+        side = _point_side_of_polyline((cx, cy), poly, on_line_tol_px=on_line_tol_px)
+
         if side == "L":
             left_dets.append(d)
         elif side == "R":
             right_dets.append(d)
         else:
+            # 在线上，按离哪块 panel 更近来分
             d_left = manhattan((cx, cy), left_panel)
             d_right = manhattan((cx, cy), right_panel)
             (left_dets if d_left <= d_right else right_dets).append(d)
+
     return left_dets, right_dets
 
 
@@ -1915,6 +1963,7 @@ def _draw_side(
     family_color_fn: Optional[
         Callable[[Set[str]], Optional[Tuple[float, float, float]]]
     ] = None,
+    lane_map: Optional[Dict[Tuple[Point, Point], Set[int]]] = None,
 ):
     # 当前侧没有设备：只画 Panel 圈
     if not dets_side:
@@ -2032,7 +2081,8 @@ def _draw_side(
         )
 
     # ===== lane_map：本侧主干和支线共用，占道避免重叠 =====
-    lane_map: Dict[Tuple[Point, Point], Set[int]] = defaultdict(set)
+    if lane_map is None:
+        lane_map = defaultdict(set)
 
     # ===== JB 聚类成若干组件（同家族，≤3 种类型） =====
     comps = components_by_family(
@@ -2371,6 +2421,8 @@ def route_with_jb_strategy_dual_panels(
 
     # 全局家族调色板：同一份 map 保证“一个家族一颜色”，不会跨组撞色
     family_global_colors: Dict[frozenset, Tuple[float, float, float]] = {}
+    lane_map_left: Dict[Tuple[Point, Point], Set[int]] = defaultdict(set)
+    lane_map_right: Dict[Tuple[Point, Point], Set[int]] = defaultdict(set)
 
     def _generate_color(idx: int) -> Tuple[float, float, float]:
         if idx < len(OKABE_ITO):
@@ -2393,12 +2445,13 @@ def route_with_jb_strategy_dual_panels(
         *,
         left_panel: Point,
         right_panel: Optional[Point],
-        divider: Optional[Tuple[Point, Point]],
+        divider: Optional[Iterable[Point]],
         prefix_left: str,
         prefix_right: str,
         color_offset: int = 0,
         family_color_fn=family_color_fn,
     ):
+        # 1) 先用 divider 把 dets 分左右
         l_dets, r_dets = _split_dets_by_line(
             dets_group,
             divider,
@@ -2408,6 +2461,20 @@ def route_with_jb_strategy_dual_panels(
             keep_labels=keep_labels,
             on_line_tol_px=on_line_tol_px,
         )
+
+        # 2) 把 divider 也当成“墙”加入 walls，禁止任何线跨过去
+        walls_base = walls or []
+        extra_walls = []
+
+        if divider is not None:
+            poly = list(divider)
+            if len(poly) >= 2:
+                # polyline 每个点就是 walls 的一个折线节点
+                extra_walls.append(poly)
+
+        walls_group = walls_base + extra_walls
+
+        # 3) 画左 panel
         left_info_g = _draw_side(
             page,
             l_dets,
@@ -2423,7 +2490,7 @@ def route_with_jb_strategy_dual_panels(
             dev_radius=dev_radius,
             panel_radius=panel_radius,
             wire_width=wire_width,
-            walls=walls,
+            walls=walls_group,  # ✅ 用带 divider 的墙
             clearance_px=clearance_px,
             color_map=color_map,
             priority_families=priority_families,
@@ -2437,7 +2504,10 @@ def route_with_jb_strategy_dual_panels(
             label_group_fn=label_group_fn,
             color_offset=color_offset,
             family_color_fn=family_color_fn,
+            lane_map=lane_map_left,
         )
+
+        # 4) 画右 panel
         right_info_g = (
             _draw_side(
                 page,
@@ -2454,7 +2524,7 @@ def route_with_jb_strategy_dual_panels(
                 dev_radius=dev_radius,
                 panel_radius=panel_radius,
                 wire_width=wire_width,
-                walls=walls,
+                walls=walls_group,  # ✅ 同样用带 divider 的墙
                 clearance_px=clearance_px,
                 color_map=color_map,
                 priority_families=priority_families,
@@ -2468,10 +2538,12 @@ def route_with_jb_strategy_dual_panels(
                 label_group_fn=label_group_fn,
                 color_offset=color_offset,
                 family_color_fn=family_color_fn,
+                lane_map=lane_map_right,
             )
             if right_panel
             else None
         )
+
         return {
             "left": left_info_g,
             "right": right_info_g,
@@ -2535,16 +2607,49 @@ def route_with_jb_strategy_dual_panels(
     }
 
 
+def print_routing_summary(summary):
+    for group_name, group_data in summary.items():
+        print(f"\n======== {group_name} ========")
+
+        left = group_data.get("left") or {}
+        right = group_data.get("right") or {}
+
+        l_jb = left.get("num_jb", 0)
+        l_dev = left.get("dev_count", 0)
+        l_trunk = left.get("trunk_edges", 0)
+
+        r_jb = right.get("num_jb", 0)
+        r_dev = right.get("dev_count", 0)
+        r_trunk = right.get("trunk_edges", 0)
+
+        l_dets = group_data.get("left_count_dets", 0)
+        r_dets = group_data.get("right_count_dets", 0)
+
+        print(
+            f"  Left panel : JB={l_jb:3d} | Dev={l_dev:3d} | Trunk edges={l_trunk:3d} | dets={l_dets}"
+        )
+        print(
+            f"  Right panel: JB={r_jb:3d} | Dev={r_dev:3d} | Trunk edges={r_trunk:3d} | dets={r_dets}"
+        )
+
+        # 如果想看家族信息，也可以顺带打一下：
+        fam_left = left.get("families") or []
+        fam_right = right.get("families") or []
+        if fam_left or fam_right:
+            print(f"  Families L: {fam_left}")
+            print(f"  Families R: {fam_right}")
+
+
 # ==================== 示例入口 ====================
 
 if __name__ == "__main__":
     # 这里用你上一条消息中的 L2_A 示例；按需替换
-    file_name = "pdf_files/L2_A"
+    file_name = "pdf_files/L2_B"
     input_pdf = f"{file_name}.pdf"
     output_pdf_route = f"{file_name}_route_dual_panels.pdf"
     PAGE_INDEX = 0
-    EMERGENCY_DEVICE_LABEL = ["14", "18", "10", "27", "12", "20", "24"]
-    NORMAL_DEVICE_LABEL = ["3", "5", "17", "19", "1"]
+    EMERGENCY_DEVICE_LABEL = ["16", "14", "12", "26", "8", "22", "29", "20"]
+    NORMAL_DEVICE_LABEL = []  # ["1", "2", "3", "5", "7", "9", "19", "21", "23", "25"]
 
     DEVICE_LABEL = EMERGENCY_DEVICE_LABEL + NORMAL_DEVICE_LABEL
     color_map = pick_device_colors(DEVICE_LABEL)
@@ -2554,13 +2659,31 @@ if __name__ == "__main__":
     def label_group_fn(lab: str) -> Optional[str]:
         return group_lookup.get(lab)
 
-    EMERGENCY_LEFT_PANEL: Point = (1941.0, 2416.0)
-    EMERGENCY_RIGHT_PANEL: Point = (1913.0, 919.0)
-    EMERGENCY_DIVIDER_LINE = ((964.16, 1648.57), (2098.93, 1948.57))
-
-    NORMAL_LEFT_PANEL: Point = (1941.0, 2416.0)
-    NORMAL_RIGHT_PANEL: Point = (1913.0, 919.0)
-    NORMAL_DIVIDER_LINE = ((964.16, 1648.57), (2098.93, 1948.57))
+    DIVIDE_LINE = [
+        (562.760009765625, 1496.06396484375),
+        (903.7191772460938, 1496.06396484375),
+        (903.7191772460938, 1654.4820556640625),
+        (925.355712890625, 1696.510986328125),
+        (987.902099609375, 1737.2969970703125),
+        (1109.2650146484375, 1741.5250244140625),
+        (1277.133056640625, 1704.220947265625),
+        (1350.125, 1670.89599609375),
+        (1421.9969482421875, 1662.1920166015625),
+        (1459.301025390625, 1617.177978515625),
+        (1485.5389404296875, 1599.02294921875),
+        (1542.987060546875, 1533.1190185546875),
+        (1585.0360107421875, 1519.8360595703125),
+        (1647.3489990234375, 1549.91796875),
+        (1744.0419921875, 1634.14794921875),
+        (1836.865966796875, 1669.8160400390625),
+        (2004.4329833984375, 1664.6590576171875),
+    ]
+    EMERGENCY_LEFT_PANEL: Point = (1745.0, 2526.0)
+    EMERGENCY_RIGHT_PANEL: Point = (1186.0, 1030.0)
+    EMERGENCY_DIVIDER_LINE = DIVIDE_LINE
+    NORMAL_LEFT_PANEL: Point = (1749.0, 2269.0)
+    NORMAL_RIGHT_PANEL: Point = (1176.6, 782.9)
+    NORMAL_DIVIDER_LINE = DIVIDE_LINE
 
     PANELS_BY_GROUP = {
         "EMERGENCY": {
@@ -2576,109 +2699,92 @@ if __name__ == "__main__":
     }
     WALLS = [
         [
-            [1886.137939453125, 2098.58447265625],
-            [1673.4949951171875, 2098.58447265625],
-            [1673.4949951171875, 2002.552001953125],
-            [1569.6240234375, 2002.552001953125],
+            [1798.677978515625, 2501.622314453125],
+            [1798.677978515625, 2606.0419921875],
+            [1705.4019775390625, 2606.0419921875],
+            [1705.4019775390625, 2464.47705078125],
+            [1799.0909423828125, 2464.47705078125],
         ],
         [
-            [1673.886962890625, 2097.800537109375],
-            [1673.886962890625, 2342.78076171875],
-            [1551.9849853515625, 2342.78076171875],
-            [1551.9849853515625, 2397.2646484375],
-            [1580.20703125, 2397.2646484375],
+            [1797.791015625, 2302.97412109375],
+            [1797.791015625, 2070.4638671875],
+            [1705.0760498046875, 2070.4638671875],
+            [1705.0760498046875, 2357.8798828125],
+            [1798.5040283203125, 2357.8798828125],
+        ],
+        [[1705.7919921875, 2070.9521484375], [1392.4639892578125, 2070.9521484375]],
+        [
+            [1182.625, 962.952880859375],
+            [1231.1610107421875, 962.952880859375],
+            [1231.1610107421875, 1253.1820068359375],
+            [1145.9749755859375, 1253.1820068359375],
+            [1145.9749755859375, 961.9619140625],
         ],
         [
-            [1490.60205078125, 2776.81689453125],
-            [1490.60205078125, 2488.328125],
-            [1481.97900390625, 2488.328125],
-            [1481.97900390625, 2475.001220703125],
-        ],
-        [[1490.2099609375, 2384.848388671875], [1490.2099609375, 2000.718994140625]],
-        [
-            [1673.6199951171875, 2343.513427734375],
-            [1673.6199951171875, 2373.455322265625],
-            [1617.5469970703125, 2373.455322265625],
-            [1617.5469970703125, 2399.586669921875],
+            [1146.489990234375, 1248.9630126953125],
+            [921.7600708007812, 1248.9630126953125],
         ],
         [
-            [1617.8189697265625, 2372.638916015625],
-            [1617.8189697265625, 2342.424560546875],
+            [1348.33203125, 606.00390625],
+            [1348.33203125, 682.701904296875],
+            [1231.3929443359375, 682.701904296875],
+            [1231.3929443359375, 852.60791015625],
+            [1198.375, 852.60791015625],
+            [1198.375, 903.510986328125],
         ],
         [
-            [924.5374145507812, 1121.6910400390625],
-            [1020.7169799804688, 1121.6910400390625],
-            [1020.7169799804688, 1276.1199951171875],
-            [1327.81201171875, 1276.1199951171875],
+            [1229.6729736328125, 718.1279296875],
+            [1137.842041015625, 718.1279296875],
+            [1137.842041015625, 853.639892578125],
+            [1150.5670166015625, 853.639892578125],
         ],
         [
-            [1119.427001953125, 1274.77099609375],
-            [1119.427001953125, 1116.72900390625],
-            [1017.8280029296875, 1116.72900390625],
+            [1522.072998046875, 2767.11328125],
+            [1522.072998046875, 2651.798828125],
+            [1611.3160400390625, 2651.798828125],
+            [1611.3160400390625, 2560.048583984375],
+            [1704.0689697265625, 2560.048583984375],
         ],
         [
-            [1105.6300048828125, 1116.802001953125],
-            [1105.6300048828125, 991.68603515625],
-            [927.598388671875, 991.68603515625],
-            [927.598388671875, 1121.0360107421875],
+            [1132.333984375, 1978.70703125],
+            [1132.333984375, 2072.5625],
+            [734.6497192382812, 2072.5625],
         ],
         [
-            [916.7935180664062, 904.0048828125],
-            [916.7935180664062, 694.60009765625],
-            [893.0872192382812, 694.60009765625],
-            [893.0872192382812, 594.695068359375],
+            [1342.5570068359375, 1344.0050048828125],
+            [1262.8389892578125, 1344.0050048828125],
+            [1262.8389892578125, 1247.7430419921875],
+            [1230.25, 1247.7430419921875],
         ],
         [
-            [916.2128295898438, 741.239990234375],
-            [1018.7780151367188, 741.239990234375],
-            [1018.7780151367188, 692.243896484375],
-            [1108.2769775390625, 692.243896484375],
-            [1108.2769775390625, 586.0859375],
+            [1138.7760009765625, 717.656005859375],
+            [1138.7760009765625, 666.590087890625],
+            [1043.3189697265625, 666.590087890625],
         ],
         [
-            [1108.60400390625, 691.263916015625],
-            [1108.60400390625, 883.656005859375],
-            [1019.4310302734375, 883.656005859375],
-        ],
-        [[1019.7579956054688, 883.98193359375], [1019.7579956054688, 740.9140625]],
-        [
-            [1018.4509887695312, 819.634033203125],
-            [967.4951782226562, 819.634033203125],
-            [967.4951782226562, 879.408935546875],
+            [568.9163208007812, 1344.8060302734375],
+            [568.9163208007812, 1247.6080322265625],
+            [680.6212158203125, 1247.6080322265625],
         ],
         [
-            [1888.239013671875, 1370.2239990234375],
-            [1962.7969970703125, 1370.2239990234375],
-            [1962.7969970703125, 1272.2919921875],
-            [1768.4129638671875, 1272.2919921875],
-            [1768.4129638671875, 1371.112060546875],
-            [1810.7220458984375, 1371.112060546875],
+            [850.9375, 2072.015625],
+            [850.9375, 1978.260009765625],
+            [926.643798828125, 1978.260009765625],
+        ],
+        [[968.25732421875, 2072.015625], [968.25732421875, 1976.2550048828125]],
+        [
+            [1043.9639892578125, 2072.015625],
+            [1043.9639892578125, 1975.7530517578125],
+            [1131.7030029296875, 1975.7530517578125],
         ],
         [
-            [1850.6639404296875, 1371.112060546875],
-            [1850.6639404296875, 1271.7010498046875],
-        ],
-        [
-            [1121.9100341796875, 2777.0693359375],
-            [1121.9100341796875, 2662.966796875],
-            [1112.35400390625, 2662.966796875],
-            [1112.35400390625, 2460.826171875],
-        ],
-        [
-            [1112.35400390625, 2402.61669921875],
-            [1112.35400390625, 2097.667724609375],
-            [1141.8929443359375, 2097.667724609375],
-        ],
-        [
-            [1769.2640380859375, 2793.044189453125],
-            [1769.2640380859375, 2681.948974609375],
-            [1777.6710205078125, 2681.948974609375],
-            [1777.6710205078125, 2585.86669921875],
-            [1675.5830078125, 2585.86669921875],
-            [1675.5830078125, 2490.384765625],
-            [1563.887939453125, 2490.384765625],
-            [1563.887939453125, 2680.747802734375],
-            [1568.6920166015625, 2680.747802734375],
+            [1410.6629638671875, 1820.3089599609375],
+            [1427.990966796875, 1820.3089599609375],
+            [1427.990966796875, 1840.5250244140625],
+            [1792.5849609375, 1840.5250244140625],
+            [1792.5849609375, 1758.9420166015625],
+            [1426.5469970703125, 1758.9420166015625],
+            [1426.5469970703125, 1821.7530517578125],
         ],
     ]
     CLEARANCE = 3.0
@@ -2710,7 +2816,7 @@ if __name__ == "__main__":
         walls=WALLS,
         clearance_px=CLEARANCE,
         color_map=color_map,
-        priority_families=[],
+        priority_families=[{"14"}],
         on_line_tol_px=2.0,
         lane_gap=8.0,  # 并排间距
         lane_mode="diag",  # "axis"（正交友好）或 "diag"
@@ -2718,5 +2824,7 @@ if __name__ == "__main__":
         allow_trunk_overlap=False,  # 主干不允许重叠（默认）
         label_group_fn=label_group_fn,
         panels_by_group=PANELS_BY_GROUP,
+        max_family_types=3,
     )
-    print("Dual-panels routing summary:", info)
+    # print("Dual-panels routing summary:", info)
+    print_routing_summary(info)
