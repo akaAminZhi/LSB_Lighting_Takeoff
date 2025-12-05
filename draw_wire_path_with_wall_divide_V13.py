@@ -1912,7 +1912,9 @@ def _draw_side(
     max_family_types: int = 2,
     label_group_fn: Optional[Callable[[str], Optional[str]]] = None,
     color_offset: int = 0,
-    family_color_fn: Optional[Callable[[Set[str]], Optional[Tuple[float, float, float]]]] = None,
+    family_color_fn: Optional[
+        Callable[[Set[str]], Optional[Tuple[float, float, float]]]
+    ] = None,
 ):
     # 当前侧没有设备：只画 Panel 圈
     if not dets_side:
@@ -2000,7 +2002,7 @@ def _draw_side(
             fill_color=None,
             width=1.1,
             title=f"JB {jb_prefix}{j} | fam:{fam_name_jb} | types:[{types_str}]",
-            subject=f"{jb_prefix}{j}",
+            subject=f"JB",
             contents="",
         )
 
@@ -2026,6 +2028,7 @@ def _draw_side(
             width=0.2,
             title=f"Dev{local_i} ({lab_i}) | fam:{fam_name_dev}",
             contents="",
+            subject="device",
         )
 
     # ===== lane_map：本侧主干和支线共用，占道避免重叠 =====
@@ -2220,6 +2223,7 @@ def _draw_side(
                         width=0.9,
                         title=f"JB {jb_prefix}S | {bus_label}",
                         contents="",
+                        subject="JB",
                     )
                     virtual_jb_drawn[jp] = bus_label
 
@@ -2288,6 +2292,7 @@ def _draw_side(
         width=0.4,
         title=f"PANEL | {'LEFT' if jb_prefix=='JBL' else 'RIGHT'}",
         contents="",
+        subject=f"PANEL | {'LEFT' if jb_prefix=='JBL' else 'RIGHT'}",
     )
 
     # ===== 统计信息返回给主流程 =====
